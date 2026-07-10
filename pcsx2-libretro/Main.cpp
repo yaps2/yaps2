@@ -34,6 +34,9 @@
 
 #include "libretro.h"
 
+#define VK_NO_PROTOTYPES
+#include "libretro_vulkan.h"
+
 #include "fmt/format.h"
 
 #include "common/Assertions.h"
@@ -53,6 +56,8 @@
 #include "pcsx2/Achievements.h"
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/GS.h"
+#include "pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h"
+#include "pcsx2/GS/Renderers/Vulkan/VKLibretro.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/INISettingsInterface.h"
@@ -94,6 +99,14 @@ namespace LibretroCore
 	static std::string s_content_path;
 	static std::thread s_cpu_thread;
 	static std::atomic<bool> s_vm_thread_running{false};
+
+	// M2 Vulkan HW-render state. The CPU thread parks the initial boot until
+	// the frontend has (a) negotiated the shared VkDevice (create_device,
+	// which opens MTGS/GSDeviceVK from the frontend thread) and (b) fired
+	// context_reset (making the retro_hw_render_interface_vulkan available).
+	static bool s_hw_render_vulkan = false;
+	static std::atomic<bool> s_cpu_thread_initialized{false};
+	static std::atomic<bool> s_context_ready{false};
 } // namespace LibretroCore
 
 // Settings persistence (INI under the frontend's system directory).
@@ -182,12 +195,14 @@ bool LibretroCore::InitializeConfig()
 	if (FileSystem::FileExists(secrets_path.c_str()))
 		s_secrets_settings->Load();
 
-	// Libretro-core overrides. M1: headless Null renderer (no display surface
-	// exists yet); SDL input/audio stay available inside the core lib but the
-	// libretro input/audio paths will replace them in M3.
+	// Libretro-core overrides. Default is the shared-context Vulkan renderer
+	// (M2); YAPS2_NULL_GS=1 falls back to the headless Null renderer (the M1
+	// smoke-test mode). SDL input/audio will be replaced by the libretro
+	// paths in M3.
 	{
 		auto lock = Host::GetSettingsLock();
-		s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::Null));
+		s_base_settings->SetIntValue("EmuCore/GS", "Renderer",
+			static_cast<int>(getenv("YAPS2_NULL_GS") ? GSRendererType::Null : GSRendererType::VK));
 		s_base_settings->SetBoolValue("InputSources", "SDL", false);
 		if (!s_base_settings->ContainsValue("SPU2/Output", "OutputModule"))
 			s_base_settings->SetStringValue("SPU2/Output", "OutputModule", "nullout");
@@ -589,10 +604,22 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 		Console.Error("CPU thread init failed.");
 		VMManager::Internal::CPUThreadShutdown();
 		s_vm_thread_running.store(false, std::memory_order_release);
+		s_cpu_thread_initialized.store(true, std::memory_order_release); // unblock load_game
 		return;
 	}
 
 	VMManager::ApplySettings();
+	s_cpu_thread_initialized.store(true, std::memory_order_release);
+
+	// With Vulkan HW render the boot has to wait for the frontend's context
+	// negotiation + context_reset; booting earlier would open MTGS before
+	// VKLibretro::Init holds the shared instance.
+	while (s_hw_render_vulkan && !s_context_ready.load(std::memory_order_acquire) &&
+			!s_shutdown_requested.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+	std::fprintf(stderr, "[libretro] CPU thread: context ready, entering VM state machine (boot file: %s)\n",
+		initial_params.filename.c_str());
 
 	std::optional<VMBootParameters> pending_boot = std::move(initial_params);
 
@@ -625,7 +652,9 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 				{
 					VMBootParameters bp = std::move(pending_boot.value());
 					pending_boot.reset();
+					std::fprintf(stderr, "[libretro] CPU thread: VMManager::Initialize...\n");
 					const VMBootResult br = VMManager::Initialize(bp);
+					std::fprintf(stderr, "[libretro] CPU thread: Initialize -> %d\n", (int)br);
 					if (br != VMBootResult::StartupSuccess)
 					{
 						Console.ErrorFmt("VMManager::Initialize failed (result {}).", static_cast<int>(br));
@@ -665,6 +694,83 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 	VMManager::Internal::CPUThreadShutdown();
 	s_cpu_thread_id.store(std::thread::id{}, std::memory_order_release);
 	s_vm_thread_running.store(false, std::memory_order_release);
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Vulkan context negotiation (M2) — the lrps2 pattern: create_device runs on
+// the frontend thread, stashes the shared instance/GPU + frontend
+// requirements into VKLibretro::Init, then opens MTGS. GSDeviceVK (on the GS
+// thread) adopts the instance, and its vkCreateDevice call is intercepted by
+// the VKLibretro wraps, which capture the resulting VkDevice for the context
+// reply below.
+//////////////////////////////////////////////////////////////////////////
+
+static const VkApplicationInfo* GetVulkanApplicationInfo(void)
+{
+	static VkApplicationInfo app_info{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+	app_info.pApplicationName = "yaps2";
+	app_info.applicationVersion = VK_MAKE_VERSION(2, 0, 0);
+	app_info.pEngineName = "yaps2";
+	app_info.engineVersion = VK_MAKE_VERSION(2, 0, 0);
+	app_info.apiVersion = VK_API_VERSION_1_1;
+	return &app_info;
+}
+
+static bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu,
+	VkSurfaceKHR surface, PFN_vkGetInstanceProcAddr get_instance_proc_addr, const char** required_device_extensions,
+	unsigned num_required_device_extensions, const char** required_device_layers,
+	unsigned num_required_device_layers, const VkPhysicalDeviceFeatures* required_features)
+{
+	VKLibretro::Init.instance = instance;
+	VKLibretro::Init.gpu = gpu;
+	VKLibretro::Init.get_instance_proc_addr = get_instance_proc_addr;
+	VKLibretro::Init.required_device_extensions = required_device_extensions;
+	VKLibretro::Init.num_required_device_extensions = num_required_device_extensions;
+	VKLibretro::Init.required_device_layers = required_device_layers;
+	VKLibretro::Init.num_required_device_layers = num_required_device_layers;
+	VKLibretro::Init.required_features = required_features;
+
+	// Bring up the GS thread now: GSDeviceVK adopts Init.instance/gpu and the
+	// wrapped vkCreateDevice fills Init.device with the shared device.
+	if (!MTGS::IsOpen() && !MTGS::WaitForOpen())
+	{
+		log_cb(RETRO_LOG_ERROR, "MTGS::WaitForOpen failed during Vulkan negotiation.\n");
+		return false;
+	}
+
+	GSDeviceVK* dev = GSDeviceVK::GetInstance();
+	if (!dev || VKLibretro::Init.device == VK_NULL_HANDLE)
+	{
+		log_cb(RETRO_LOG_ERROR, "GS device missing after negotiation open.\n");
+		return false;
+	}
+
+	context->gpu = dev->GetPhysicalDevice();
+	context->device = VKLibretro::Init.device;
+	context->queue = dev->GetGraphicsQueue();
+	context->queue_family_index = dev->GetGraphicsQueueFamilyIndex();
+	context->presentation_queue = context->queue;
+	context->presentation_queue_family_index = context->queue_family_index;
+	return true;
+}
+
+static void OnContextReset(void)
+{
+	retro_hw_render_interface* iface = nullptr;
+	if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &iface) || !iface ||
+		iface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN)
+	{
+		log_cb(RETRO_LOG_ERROR, "Failed to get Vulkan HW render interface.\n");
+		return;
+	}
+	VKLibretro::SetHWRenderInterface(iface);
+	LibretroCore::s_context_ready.store(true, std::memory_order_release);
+}
+
+static void OnContextDestroy(void)
+{
+	LibretroCore::s_context_ready.store(false, std::memory_order_release);
+	VKLibretro::SetHWRenderInterface(nullptr);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -790,11 +896,60 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 	params.fast_boot = true;
 
 	s_shutdown_requested.store(false, std::memory_order_release);
+
+	// Vulkan HW render (unless the Null fallback is forced). The negotiation
+	// interface must be registered inside retro_load_game; the frontend
+	// invokes it while creating its Vulkan context, after this returns.
+	LibretroCore::s_hw_render_vulkan = !getenv("YAPS2_NULL_GS");
+	if (LibretroCore::s_hw_render_vulkan)
+	{
+		static struct retro_hw_render_callback hw_render = {};
+		hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+		hw_render.version_major = 1;
+		hw_render.version_minor = 1;
+		hw_render.context_reset = OnContextReset;
+		hw_render.context_destroy = OnContextDestroy;
+		hw_render.cache_context = true;
+		if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+		{
+			log_cb(RETRO_LOG_ERROR, "Frontend refused Vulkan HW context; falling back to Null GS.\n");
+			LibretroCore::s_hw_render_vulkan = false;
+			auto lock = Host::GetSettingsLock();
+			s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::Null));
+			VMManager::Internal::LoadStartupSettings();
+		}
+		else
+		{
+			static const struct retro_hw_render_context_negotiation_interface_vulkan neg_iface = {
+				RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN,
+				RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION,
+				GetVulkanApplicationInfo,
+				CreateVulkanDevice,
+				nullptr, // destroy_device
+			};
+			environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, (void*)&neg_iface);
+
+			Error vk_error;
+			if (!Vulkan::IsVulkanLibraryLoaded() && !Vulkan::LoadVulkanLibrary(&vk_error))
+			{
+				log_cb(RETRO_LOG_ERROR, "LoadVulkanLibrary: %s\n", vk_error.GetDescription().c_str());
+				return false;
+			}
+			VKLibretro::InstallWraps();
+			VKLibretro::Active = true;
+		}
+	}
+
 	SysMemory::ReserveMemory();
 
 	LibretroCore::s_cpu_thread = std::thread([params = std::move(params)]() mutable {
 		LibretroCore::CPUThreadMain(std::move(params));
 	});
+
+	// The negotiation callback (frontend thread, after we return) opens MTGS;
+	// global state it depends on comes from CPUThreadInitialize — wait for it.
+	while (!LibretroCore::s_cpu_thread_initialized.load(std::memory_order_acquire))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
 	return true;
 }
@@ -816,17 +971,54 @@ RETRO_API void retro_unload_game(void)
 	s_base_settings.reset();
 	s_secrets_settings.reset();
 	LibretroCore::s_content_path.clear();
+	VKLibretro::Shutdown();
+	VKLibretro::Active = false;
+	LibretroCore::s_context_ready.store(false, std::memory_order_release);
+	LibretroCore::s_cpu_thread_initialized.store(false, std::memory_order_release);
 }
 
 RETRO_API void retro_run(void)
 {
 	input_poll_cb();
 
-	// M1: the VM free-runs on the CPU thread with the Null GS renderer; there
-	// is no frame handoff yet, so present the placeholder buffer. M2/M3 turn
-	// this into "block until MTGS presents one frame, then hand it over".
-	video_cb(LibretroCore::s_frame_buffer.data(), LibretroCore::kFrameWidth,
-		LibretroCore::kFrameHeight, LibretroCore::kFrameWidth * sizeof(u32));
+	// TEMP (M2 bring-up): pace headless harness runs so the free-running VM
+	// gets wall-clock time to boot.
+	if (getenv("YAPS2_RUN_SLEEP"))
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+
+	if (LibretroCore::s_hw_render_vulkan)
+	{
+		// M2: consume the newest GS frame (if any) and hand it to the
+		// frontend. The retro_vulkan_image storage must outlive this call --
+		// the frontend keeps the pointer for cached-frame replays.
+		VKLibretro::Frame frame;
+		auto* vulkan = static_cast<retro_hw_render_interface_vulkan*>(VKLibretro::GetHWRenderInterface());
+		if (vulkan && VKLibretro::ConsumeFrame(&frame))
+		{
+			static retro_vulkan_image vkimage;
+			vkimage = {};
+			vkimage.image_view = frame.view;
+			vkimage.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			vkimage.create_info = {
+				VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0,
+				frame.image, VK_IMAGE_VIEW_TYPE_2D, frame.format,
+				{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+					VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+				{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+			vulkan->set_image(vulkan->handle, &vkimage, 0, nullptr, vulkan->queue_index);
+			video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
+		}
+		else
+		{
+			video_cb(nullptr, LibretroCore::kFrameWidth, LibretroCore::kFrameHeight, 0);
+		}
+	}
+	else
+	{
+		// Null-GS fallback: placeholder software frame.
+		video_cb(LibretroCore::s_frame_buffer.data(), LibretroCore::kFrameWidth,
+			LibretroCore::kFrameHeight, LibretroCore::kFrameWidth * sizeof(u32));
+	}
 }
 
 RETRO_API size_t retro_serialize_size(void)

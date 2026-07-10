@@ -9,6 +9,7 @@
 #include "GS/Renderers/Vulkan/VKBuilders.h"
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/VKSwapChain.h"
+#include "GS/Renderers/Vulkan/VKLibretro.h"
 #include "GS/Renderers/Common/GSDevice.h"
 
 #include "BuildVersion.h"
@@ -2351,7 +2352,8 @@ void GSDeviceVK::Destroy()
 		DisableDebugUtils();
 
 	if (m_instance != VK_NULL_HANDLE)
-		vkDestroyInstance(m_instance, nullptr);
+		if (!(VKLibretro::Active && VKLibretro::Init.instance == m_instance))
+			vkDestroyInstance(m_instance, nullptr);
 
 	Vulkan::UnloadVulkanLibrary();
 }
@@ -2513,6 +2515,26 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 	// If we're running surfaceless, kick the command buffer so we don't run out of descriptors.
 	if (!m_swap_chain)
 	{
+		// Libretro handoff: instead of drawing to a swapchain, hand the
+		// merged display texture to the frontend (it samples the VkImageView
+		// directly; the lrps2 pattern). ShaderReadOnly matches the layout the
+		// frontend expects to sample from.
+		if (VKLibretro::Active && m_current)
+		{
+			GSTextureVK* cur = static_cast<GSTextureVK*>(m_current);
+			cur->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+			ExecuteCommandBuffer(false);
+
+			VKLibretro::Frame frame;
+			frame.image = cur->GetImage();
+			frame.view = cur->GetView();
+			frame.format = cur->GetVkFormat();
+			frame.width = static_cast<u32>(cur->GetWidth());
+			frame.height = static_cast<u32>(cur->GetHeight());
+			VKLibretro::PublishFrame(frame);
+			return PresentResult::FrameSkipped;
+		}
+
 		ExecuteCommandBuffer(false);
 		return PresentResult::FrameSkipped;
 	}
@@ -2692,7 +2714,9 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 	bool enable_validation_layer = GSConfig.UseDebugDevice;
 
 	Error error;
-	if (!Vulkan::LoadVulkanLibrary(&error))
+	// The libretro frontend loads the library (and installs the negotiation
+	// wraps) before GS opens; loading twice trips the loader's assert.
+	if (!Vulkan::IsVulkanLibraryLoaded() && !Vulkan::LoadVulkanLibrary(&error))
 	{
 		Error::AddPrefix(&error, "Failed to load Vulkan library. Does your GPU and/or driver support Vulkan?\nThe error was:\n");
 		Host::ReportErrorAsync("Error", error.GetDescription());
@@ -2702,7 +2726,13 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 	if (!AcquireWindow(true))
 		return false;
 
-	m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer);
+	// Libretro context sharing: the VkInstance comes from the frontend's
+	// negotiation interface. Function loading still goes through the wrapped
+	// vkGetInstanceProcAddr so vkCreateDevice/vkQueueSubmit get intercepted.
+	if (VKLibretro::Active && VKLibretro::Init.instance != VK_NULL_HANDLE)
+		m_instance = VKLibretro::Init.instance;
+	else
+		m_instance = CreateVulkanInstance(m_window_info, &m_optional_extensions, enable_debug_utils, enable_validation_layer);
 	if (m_instance == VK_NULL_HANDLE)
 	{
 		if (enable_debug_utils || enable_validation_layer)
@@ -2734,6 +2764,15 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 		return false;
 	}
 
+	if (VKLibretro::Active && VKLibretro::Init.gpu != VK_NULL_HANDLE)
+	{
+		// Frontend picked the physical device during negotiation.
+		m_physical_device = VKLibretro::Init.gpu;
+		vkGetPhysicalDeviceProperties(m_physical_device, &m_device_properties);
+		m_name = m_device_properties.deviceName;
+	}
+	else
+	{
 	const bool is_default_gpu = GSConfig.Adapter == GetDefaultAdapter();
 	if (!(GSConfig.Adapter.empty() || is_default_gpu))
 	{
@@ -2765,6 +2804,7 @@ bool GSDeviceVK::CreateDeviceAndSwapChain()
 
 	// Stores the GPU name
 	m_name = m_device_properties.deviceName;
+	} // !VKLibretro gpu adoption
 
 	// We need this to be at least 32 byte aligned for AVX2 stores.
 	m_device_properties.limits.minUniformBufferOffsetAlignment =
