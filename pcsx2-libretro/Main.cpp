@@ -17,6 +17,7 @@
 //      audio batching, libretro input -> Pad, core options -> settings.
 //  M4: save states over retro_serialize, disk control, memcard-per-content.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -69,6 +70,10 @@
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/SIO/Pad/Pad.h"
+#include "pcsx2/SIO/Pad/PadBase.h"
+#include "pcsx2/SIO/Pad/PadDualshock2.h"
+#include "pcsx2/SPU2/spu2.h"
+#include "pcsx2/Host/AudioStream.h"
 #include "pcsx2/VMManager.h"
 
 #include "svnrev.h"
@@ -150,6 +155,12 @@ bool LibretroCore::InitializeConfig()
 	EmuFolders::AppRoot = Path::Combine(system_base, "pcsx2");
 	EmuFolders::Resources = Path::Combine(EmuFolders::AppRoot, "resources");
 	EmuFolders::DataRoot = EmuFolders::AppRoot;
+	// Normally derived inside SetDataDirectory(), which the libretro path
+	// bypasses (the frontend dictates the root) -- set it explicitly or the
+	// INI lands in the process cwd.
+	EmuFolders::Settings = Path::Combine(EmuFolders::DataRoot, "inis");
+	FileSystem::EnsureDirectoryExists(EmuFolders::DataRoot.c_str(), false);
+	FileSystem::EnsureDirectoryExists(EmuFolders::Settings.c_str(), false);
 
 	CrashHandler::SetWriteDirectory(EmuFolders::DataRoot);
 
@@ -204,8 +215,9 @@ bool LibretroCore::InitializeConfig()
 		s_base_settings->SetIntValue("EmuCore/GS", "Renderer",
 			static_cast<int>(getenv("YAPS2_NULL_GS") ? GSRendererType::Null : GSRendererType::VK));
 		s_base_settings->SetBoolValue("InputSources", "SDL", false);
-		if (!s_base_settings->ContainsValue("SPU2/Output", "OutputModule"))
-			s_base_settings->SetStringValue("SPU2/Output", "OutputModule", "nullout");
+		// Audio goes out through retro_run pulling the stream ring; the Null
+		// backend keeps SPU2 mixing into the ring with no device thread.
+		s_base_settings->SetStringValue("SPU2/Output", "Backend", "Null");
 	}
 
 	Error save_error;
@@ -764,11 +776,13 @@ static void OnContextReset(void)
 		return;
 	}
 	VKLibretro::SetHWRenderInterface(iface);
+	VKLibretro::SetPacing(true);
 	LibretroCore::s_context_ready.store(true, std::memory_order_release);
 }
 
 static void OnContextDestroy(void)
 {
+	VKLibretro::AbortPacing();
 	LibretroCore::s_context_ready.store(false, std::memory_order_release);
 	VKLibretro::SetHWRenderInterface(nullptr);
 }
@@ -961,6 +975,7 @@ RETRO_API bool retro_load_game_special(unsigned game_type, const struct retro_ga
 
 RETRO_API void retro_unload_game(void)
 {
+	VKLibretro::AbortPacing(); // GS thread may be parked in PublishFrame
 	s_shutdown_requested.store(true, std::memory_order_release);
 	if (VMManager::HasValidVM())
 		VMManager::SetState(VMState::Stopping);
@@ -985,6 +1000,57 @@ RETRO_API void retro_run(void)
 	// gets wall-clock time to boot.
 	if (getenv("YAPS2_RUN_SLEEP"))
 		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+
+	// M3 input: forward the libretro joypad straight into the DualShock2
+	// bind slots (bypasses InputManager entirely).
+	if (VMManager::HasValidVM())
+	{
+		if (PadBase* pad = Pad::GetPad(0))
+		{
+			static constexpr struct
+			{
+				unsigned retro;
+				u32 ds2;
+			} bmap[] = {
+				{RETRO_DEVICE_ID_JOYPAD_UP, PadDualshock2::Inputs::PAD_UP},
+				{RETRO_DEVICE_ID_JOYPAD_RIGHT, PadDualshock2::Inputs::PAD_RIGHT},
+				{RETRO_DEVICE_ID_JOYPAD_DOWN, PadDualshock2::Inputs::PAD_DOWN},
+				{RETRO_DEVICE_ID_JOYPAD_LEFT, PadDualshock2::Inputs::PAD_LEFT},
+				{RETRO_DEVICE_ID_JOYPAD_X, PadDualshock2::Inputs::PAD_TRIANGLE},
+				{RETRO_DEVICE_ID_JOYPAD_A, PadDualshock2::Inputs::PAD_CIRCLE},
+				{RETRO_DEVICE_ID_JOYPAD_B, PadDualshock2::Inputs::PAD_CROSS},
+				{RETRO_DEVICE_ID_JOYPAD_Y, PadDualshock2::Inputs::PAD_SQUARE},
+				{RETRO_DEVICE_ID_JOYPAD_SELECT, PadDualshock2::Inputs::PAD_SELECT},
+				{RETRO_DEVICE_ID_JOYPAD_START, PadDualshock2::Inputs::PAD_START},
+				{RETRO_DEVICE_ID_JOYPAD_L, PadDualshock2::Inputs::PAD_L1},
+				{RETRO_DEVICE_ID_JOYPAD_L2, PadDualshock2::Inputs::PAD_L2},
+				{RETRO_DEVICE_ID_JOYPAD_R, PadDualshock2::Inputs::PAD_R1},
+				{RETRO_DEVICE_ID_JOYPAD_R2, PadDualshock2::Inputs::PAD_R2},
+				{RETRO_DEVICE_ID_JOYPAD_L3, PadDualshock2::Inputs::PAD_L3},
+				{RETRO_DEVICE_ID_JOYPAD_R3, PadDualshock2::Inputs::PAD_R3},
+			};
+			for (const auto& m : bmap)
+				pad->Set(m.ds2, input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro) ? 1.0f : 0.0f);
+
+			// Analog sticks: split each axis into the two directional slots.
+			const auto axis = [](s16 v, bool positive) {
+				const float f = std::clamp(static_cast<float>(v) / 32767.0f, -1.0f, 1.0f);
+				return positive ? std::max(f, 0.0f) : std::max(-f, 0.0f);
+			};
+			const s16 lx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+			const s16 ly = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+			const s16 rx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+			const s16 ry = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+			pad->Set(PadDualshock2::Inputs::PAD_L_RIGHT, axis(lx, true));
+			pad->Set(PadDualshock2::Inputs::PAD_L_LEFT, axis(lx, false));
+			pad->Set(PadDualshock2::Inputs::PAD_L_DOWN, axis(ly, true));
+			pad->Set(PadDualshock2::Inputs::PAD_L_UP, axis(ly, false));
+			pad->Set(PadDualshock2::Inputs::PAD_R_RIGHT, axis(rx, true));
+			pad->Set(PadDualshock2::Inputs::PAD_R_LEFT, axis(rx, false));
+			pad->Set(PadDualshock2::Inputs::PAD_R_DOWN, axis(ry, true));
+			pad->Set(PadDualshock2::Inputs::PAD_R_UP, axis(ry, false));
+		}
+	}
 
 	if (LibretroCore::s_hw_render_vulkan)
 	{
@@ -1018,6 +1084,38 @@ RETRO_API void retro_run(void)
 		// Null-GS fallback: placeholder software frame.
 		video_cb(LibretroCore::s_frame_buffer.data(), LibretroCore::kFrameWidth,
 			LibretroCore::kFrameHeight, LibretroCore::kFrameWidth * sizeof(u32));
+	}
+
+	// Bring-up diagnostics (YAPS2_PERF_LOG=1): internal speed probe.
+	if (getenv("YAPS2_PERF_LOG"))
+	{
+		static u32 run_count = 0;
+		if ((++run_count % 600) == 0)
+			std::fprintf(stderr, "[libretro] perf: fps=%.1f speed=%.0f%%\n",
+				PerformanceMetrics::GetFPS(), PerformanceMetrics::GetSpeed());
+	}
+
+	// M3 audio: drain whatever SPU2 mixed since the last retro_run out of the
+	// (null-backend) stream ring and hand it to the frontend.
+	if (AudioStream* stream = SPU2::GetOutputStream())
+	{
+		static AudioStream::SampleType fbuf[2048 * 2];
+		static s16 abuf[2048 * 2];
+		u32 frames;
+		while ((frames = stream->PullFrames(fbuf, 2048)) > 0)
+		{
+			for (u32 i = 0; i < frames * 2; i++)
+				abuf[i] = static_cast<s16>(std::clamp(fbuf[i], -1.0f, 1.0f) * 32767.0f);
+			const s16* p = abuf;
+			while (frames > 0)
+			{
+				const size_t sent = audio_batch_cb(p, frames);
+				p += sent * 2;
+				frames -= static_cast<u32>(sent);
+				if (!sent)
+					break;
+			}
+		}
 	}
 }
 

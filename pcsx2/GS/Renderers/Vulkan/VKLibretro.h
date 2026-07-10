@@ -65,5 +65,12 @@ namespace VKLibretro
 	void PublishFrame(const Frame& frame);
 	bool ConsumeFrame(Frame* out_frame); // true if a new frame arrived since the last consume
 
+	// Frame pacing: when enabled, PublishFrame blocks the GS thread until
+	// retro_run consumes the frame — the frontend's retro_run cadence becomes
+	// the emulation's vsync. Abort before shutdown so the GS thread can't be
+	// left parked.
+	void SetPacing(bool enabled);
+	void AbortPacing();
+
 	void Shutdown();
 } // namespace VKLibretro

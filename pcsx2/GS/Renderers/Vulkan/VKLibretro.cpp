@@ -5,6 +5,7 @@
 
 #include "common/Console.h"
 
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -148,15 +149,21 @@ namespace VKLibretro
 	}
 
 	static std::mutex s_frame_mutex;
+	static std::condition_variable s_frame_consumed_cv;
 	static Frame s_frame;
 	static u64 s_frame_serial = 0;
 	static u64 s_frame_consumed = 0;
+	static bool s_pacing = false;
 
 	void PublishFrame(const Frame& frame)
 	{
-		std::lock_guard<std::mutex> lock(s_frame_mutex);
+		std::unique_lock<std::mutex> lock(s_frame_mutex);
 		s_frame = frame;
 		s_frame_serial++;
+		// Block the GS thread until retro_run picks the frame up (or pacing
+		// gets aborted for shutdown): one presented frame per retro_run.
+		s_frame_consumed_cv.wait(
+			lock, []() { return !s_pacing || s_frame_consumed == s_frame_serial; });
 	}
 
 	bool ConsumeFrame(Frame* out_frame)
@@ -166,7 +173,21 @@ namespace VKLibretro
 			return false;
 		s_frame_consumed = s_frame_serial;
 		*out_frame = s_frame;
+		s_frame_consumed_cv.notify_all();
 		return true;
+	}
+
+	void SetPacing(bool enabled)
+	{
+		std::lock_guard<std::mutex> lock(s_frame_mutex);
+		s_pacing = enabled;
+		if (!enabled)
+			s_frame_consumed_cv.notify_all();
+	}
+
+	void AbortPacing()
+	{
+		SetPacing(false);
 	}
 
 	void Shutdown()
@@ -177,5 +198,7 @@ namespace VKLibretro
 		s_frame = Frame();
 		s_frame_serial = 0;
 		s_frame_consumed = 0;
+		s_pacing = false;
+		s_frame_consumed_cv.notify_all();
 	}
 } // namespace VKLibretro
