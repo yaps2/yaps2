@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -1084,6 +1085,23 @@ RETRO_API void retro_run(void)
 		// Null-GS fallback: placeholder software frame.
 		video_cb(LibretroCore::s_frame_buffer.data(), LibretroCore::kFrameWidth,
 			LibretroCore::kFrameHeight, LibretroCore::kFrameWidth * sizeof(u32));
+	}
+
+	// PAL/NTSC: retro_get_system_av_info runs before the VM boots, so the
+	// initial reply assumes NTSC. Once the VM reports a different vertical
+	// frequency (PAL 50Hz, progressive modes), update the frontend.
+	if (VMManager::HasValidVM())
+	{
+		static float reported_fps = 59.94f;
+		const float fps = VMManager::GetFrameRate();
+		if (fps > 1.0f && std::abs(fps - reported_fps) > 0.25f)
+		{
+			reported_fps = fps;
+			struct retro_system_av_info av;
+			retro_get_system_av_info(&av);
+			av.timing.fps = fps;
+			environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+		}
 	}
 
 	// Bring-up diagnostics (YAPS2_PERF_LOG=1): internal speed probe.

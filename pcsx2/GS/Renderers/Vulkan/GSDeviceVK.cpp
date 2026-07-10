@@ -10,6 +10,21 @@
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/VKSwapChain.h"
 #include "GS/Renderers/Vulkan/VKLibretro.h"
+
+// Libretro presentation backbuffers: the frontend samples the published
+// VkImageView asynchronously (including cached-frame replays long after the
+// present), so it must never point at a pooled texture that GSDeviceVK can
+// recycle. Frames are copied into this small ring of dedicated textures that
+// live until device teardown.
+namespace
+{
+	constexpr int kLibretroBackbuffers = 3;
+	std::unique_ptr<GSTextureVK> s_libretro_bb[kLibretroBackbuffers];
+	int s_libretro_bb_idx = 0;
+	// Displaced by a resolution change but possibly still referenced by the
+	// frontend's cached-frame replay; freed only at device teardown.
+	std::vector<std::unique_ptr<GSTextureVK>> s_libretro_bb_retired;
+} // namespace
 #include "GS/Renderers/Common/GSDevice.h"
 
 #include "BuildVersion.h"
@@ -2327,6 +2342,17 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 void GSDeviceVK::Destroy()
 {
+	// Free the libretro backbuffers while the device is still alive; the
+	// frontend stopped sampling at context_destroy.
+	if (VKLibretro::Active)
+	{
+		WaitForGPUIdle();
+		for (std::unique_ptr<GSTextureVK>& bb : s_libretro_bb)
+			bb.reset();
+		s_libretro_bb_retired.clear();
+		s_libretro_bb_idx = 0;
+	}
+
 	std::unique_lock lock(s_instance_mutex);
 
 	GSDevice::Destroy();
@@ -2515,24 +2541,42 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 	// If we're running surfaceless, kick the command buffer so we don't run out of descriptors.
 	if (!m_swap_chain)
 	{
-		// Libretro handoff: instead of drawing to a swapchain, hand the
-		// merged display texture to the frontend (it samples the VkImageView
-		// directly; the lrps2 pattern). ShaderReadOnly matches the layout the
-		// frontend expects to sample from.
+		// Libretro handoff: instead of drawing to a swapchain, copy the merged
+		// display texture into a dedicated backbuffer and hand that to the
+		// frontend. m_current itself is pooled and can be recycled while the
+		// frontend still samples the view (cached-frame replay), so the copy
+		// is what keeps the handed-out image stable.
 		if (VKLibretro::Active && m_current)
 		{
 			GSTextureVK* cur = static_cast<GSTextureVK*>(m_current);
-			cur->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
-			ExecuteCommandBuffer(false);
+			std::unique_ptr<GSTextureVK>& bb = s_libretro_bb[s_libretro_bb_idx];
+			if (!bb || bb->GetWidth() != cur->GetWidth() || bb->GetHeight() != cur->GetHeight() ||
+				bb->GetFormat() != cur->GetFormat())
+			{
+				// The frontend may still replay the old image (e.g. its menu
+				// re-presents the last frame indefinitely), so it must stay
+				// alive for the rest of the session -- retire, don't destroy.
+				if (bb)
+					s_libretro_bb_retired.push_back(std::move(bb));
+				bb = GSTextureVK::Create(GSTexture::Type::RenderTarget, cur->GetFormat(),
+					cur->GetWidth(), cur->GetHeight(), 1);
+			}
+			if (bb)
+			{
+				s_libretro_bb_idx = (s_libretro_bb_idx + 1) % kLibretroBackbuffers;
+				CopyRect(cur, bb.get(), GSVector4i(0, 0, cur->GetWidth(), cur->GetHeight()), 0, 0);
+				bb->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+				ExecuteCommandBuffer(false);
 
-			VKLibretro::Frame frame;
-			frame.image = cur->GetImage();
-			frame.view = cur->GetView();
-			frame.format = cur->GetVkFormat();
-			frame.width = static_cast<u32>(cur->GetWidth());
-			frame.height = static_cast<u32>(cur->GetHeight());
-			VKLibretro::PublishFrame(frame);
-			return PresentResult::FrameSkipped;
+				VKLibretro::Frame frame;
+				frame.image = bb->GetImage();
+				frame.view = bb->GetView();
+				frame.format = bb->GetVkFormat();
+				frame.width = static_cast<u32>(bb->GetWidth());
+				frame.height = static_cast<u32>(bb->GetHeight());
+				VKLibretro::PublishFrame(frame);
+				return PresentResult::FrameSkipped;
+			}
 		}
 
 		ExecuteCommandBuffer(false);
