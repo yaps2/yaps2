@@ -711,6 +711,170 @@ void LibretroCore::CPUThreadMain(VMBootParameters initial_params)
 }
 
 //////////////////////////////////////////////////////////////////////////
+// Disk control (M4): multi-disc via .m3u playlists. Disc swaps go through
+// VMManager::ChangeDisc on the CPU thread.
+//////////////////////////////////////////////////////////////////////////
+
+static std::vector<std::string> s_disk_images;
+static unsigned s_disk_index = 0;
+static bool s_disk_ejected = false;
+
+static bool RETRO_CALLCONV DiskSetEjectState(bool ejected)
+{
+	if (ejected == s_disk_ejected)
+		return true;
+	s_disk_ejected = ejected;
+	if (!ejected && s_disk_index < s_disk_images.size() && VMManager::HasValidVM())
+	{
+		const std::string path = s_disk_images[s_disk_index];
+		Host::RunOnCPUThread([path]() { VMManager::ChangeDisc(CDVD_SourceType::Iso, path); }, false);
+	}
+	return true;
+}
+
+static bool RETRO_CALLCONV DiskGetEjectState(void)
+{
+	return s_disk_ejected;
+}
+
+static unsigned RETRO_CALLCONV DiskGetImageIndex(void)
+{
+	return s_disk_index;
+}
+
+static bool RETRO_CALLCONV DiskSetImageIndex(unsigned index)
+{
+	if (index >= s_disk_images.size())
+		return false;
+	s_disk_index = index;
+	return true;
+}
+
+static unsigned RETRO_CALLCONV DiskGetNumImages(void)
+{
+	return static_cast<unsigned>(s_disk_images.size());
+}
+
+static bool RETRO_CALLCONV DiskReplaceImageIndex(unsigned index, const struct retro_game_info* info)
+{
+	if (index >= s_disk_images.size())
+		return false;
+	if (!info || !info->path)
+		s_disk_images.erase(s_disk_images.begin() + index);
+	else
+		s_disk_images[index] = info->path;
+	return true;
+}
+
+static bool RETRO_CALLCONV DiskAddImageIndex(void)
+{
+	s_disk_images.emplace_back();
+	return true;
+}
+
+static bool RETRO_CALLCONV DiskGetImagePath(unsigned index, char* path, size_t len)
+{
+	if (index >= s_disk_images.size())
+		return false;
+	StringUtil::Strlcpy(path, s_disk_images[index], len);
+	return true;
+}
+
+static bool RETRO_CALLCONV DiskGetImageLabel(unsigned index, char* label, size_t len)
+{
+	if (index >= s_disk_images.size())
+		return false;
+	StringUtil::Strlcpy(label, Path::GetFileTitle(s_disk_images[index]), len);
+	return true;
+}
+
+static void RegisterDiskControl(void)
+{
+	static const struct retro_disk_control_ext_callback cb = {
+		DiskSetEjectState, DiskGetEjectState,
+		DiskGetImageIndex, DiskSetImageIndex,
+		DiskGetNumImages, DiskReplaceImageIndex, DiskAddImageIndex,
+		nullptr, // set_initial_image
+		DiskGetImagePath, DiskGetImageLabel,
+	};
+	environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, (void*)&cb);
+}
+
+// Parse an .m3u playlist into s_disk_images; returns the first disc path.
+static std::string LoadM3UPlaylist(const std::string& m3u_path)
+{
+	s_disk_images.clear();
+	const std::string base = std::string(Path::GetDirectory(m3u_path));
+
+	const auto data = FileSystem::ReadFileToString(m3u_path.c_str());
+	if (!data.has_value())
+		return {};
+
+	for (std::string_view line_v : StringUtil::SplitString(data.value(), '\n', true))
+	{
+		std::string line(StringUtil::StripWhitespace(line_v));
+		if (line.empty() || line[0] == '#')
+			continue;
+		if (!Path::IsAbsolute(line))
+			line = Path::Combine(base, line);
+		s_disk_images.push_back(std::move(line));
+	}
+
+	return s_disk_images.empty() ? std::string() : s_disk_images.front();
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Core options (M4). Applied at load and re-applied on change notifications
+// from the frontend; ApplySettings runs on the CPU thread.
+//////////////////////////////////////////////////////////////////////////
+
+static const struct retro_variable kCoreVariables[] = {
+	{"yaps2_renderer", "GS renderer (restart); Vulkan|Software"},
+	{"yaps2_upscale", "Internal resolution; 1x|2x|3x|4x"},
+	{"yaps2_fast_boot", "Fast boot; enabled|disabled"},
+	{"yaps2_widescreen_patches", "Widescreen patches (restart); disabled|enabled"},
+	{nullptr, nullptr},
+};
+
+static void ApplyCoreOptions(bool startup)
+{
+	if (!s_base_settings)
+		return;
+
+	struct retro_variable var;
+	{
+		auto lock = Host::GetSettingsLock();
+
+		var = {"yaps2_renderer", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && startup)
+		{
+			// Renderer swaps need the whole context negotiation to rerun;
+			// only honour this at startup.
+			if (!std::strcmp(var.value, "Software"))
+				s_base_settings->SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
+		}
+
+		var = {"yaps2_upscale", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetFloatValue("EmuCore/GS", "upscale_multiplier",
+				static_cast<float>(std::clamp(atoi(var.value), 1, 4)));
+
+		var = {"yaps2_fast_boot", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore", "EnableFastBoot", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_widescreen_patches", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore", "EnableWideScreenPatches", !std::strcmp(var.value, "enabled"));
+	}
+
+	if (startup)
+		VMManager::Internal::LoadStartupSettings();
+	else
+		Host::RunOnCPUThread([]() { VMManager::ApplySettings(); }, false);
+}
+
+//////////////////////////////////////////////////////////////////////////
 // Vulkan context negotiation (M2) — the lrps2 pattern: create_device runs on
 // the frontend thread, stashes the shared instance/GPU + frontend
 // requirements into VKLibretro::Init, then opens MTGS. GSDeviceVK (on the GS
@@ -810,6 +974,8 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
 	bool support_no_game = false;
 	cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &support_no_game);
+
+	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)kCoreVariables);
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb)
@@ -855,7 +1021,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info* info)
 	std::memset(info, 0, sizeof(*info));
 	info->library_name = "yaps2";
 	info->library_version = GIT_REV;
-	info->valid_extensions = "elf|iso|ciso|chd|cso|zso|bin|mdf|nrg|dump|gz|img|irx";
+	info->valid_extensions = "elf|iso|ciso|chd|cso|zso|bin|mdf|nrg|dump|gz|img|irx|m3u";
 	info->need_fullpath = true;
 	info->block_extract = true;
 }
@@ -899,11 +1065,30 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 		return false;
 	}
 
+	ApplyCoreOptions(true);
+
 	VMBootParameters params;
 	if (game && game->path)
 	{
 		LibretroCore::s_content_path = game->path;
-		params.filename = LibretroCore::s_content_path;
+		if (StringUtil::EndsWithNoCase(LibretroCore::s_content_path, ".m3u"))
+		{
+			const std::string first = LoadM3UPlaylist(LibretroCore::s_content_path);
+			if (first.empty())
+			{
+				log_cb(RETRO_LOG_ERROR, "Empty or unreadable m3u playlist.\n");
+				return false;
+			}
+			params.filename = first;
+		}
+		else
+		{
+			s_disk_images = {LibretroCore::s_content_path};
+			params.filename = LibretroCore::s_content_path;
+		}
+		s_disk_index = 0;
+		s_disk_ejected = false;
+		RegisterDiskControl();
 	}
 	else
 	{
@@ -988,6 +1173,9 @@ RETRO_API void retro_unload_game(void)
 	s_base_settings.reset();
 	s_secrets_settings.reset();
 	LibretroCore::s_content_path.clear();
+	s_disk_images.clear();
+	s_disk_index = 0;
+	s_disk_ejected = false;
 	VKLibretro::Shutdown();
 	VKLibretro::Active = false;
 	LibretroCore::s_context_ready.store(false, std::memory_order_release);
@@ -997,6 +1185,10 @@ RETRO_API void retro_unload_game(void)
 RETRO_API void retro_run(void)
 {
 	input_poll_cb();
+
+	bool options_updated = false;
+	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) && options_updated)
+		ApplyCoreOptions(false);
 
 	// TEMP (M2 bring-up): pace headless harness runs so the free-running VM
 	// gets wall-clock time to boot.
