@@ -69,6 +69,7 @@
 #include "pcsx2/Input/InputManager.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
+#include "pcsx2/SaveState.h"
 #include "pcsx2/Memory.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadBase.h"
@@ -1137,19 +1138,89 @@ RETRO_API void retro_run(void)
 	}
 }
 
+// Fixed upper bound: SaveState_DownloadState uses a 64 MiB working buffer;
+// zstd-compressed zip output is far below that. libretro requires a stable
+// size, so report the bound plus slack for headers/screenshot.
+static constexpr size_t kSerializeSize = 68 * 1024 * 1024;
+
 RETRO_API size_t retro_serialize_size(void)
 {
-	return 0;
+	return VMManager::HasValidVM() ? kSerializeSize : 0;
 }
 
 RETRO_API bool retro_serialize(void* data, size_t size)
 {
-	return false;
+	if (!VMManager::HasValidVM())
+		return false;
+
+	// Pacing must be off while retro_run isn't being called, or the GS
+	// thread stays parked in PublishFrame and the state freeze (which needs
+	// the GS thread to respond) deadlocks.
+	VKLibretro::SetPacing(false);
+
+	std::vector<u8> buffer;
+	bool ok = false;
+	Host::RunOnCPUThread([&buffer, &ok]() {
+		if (!VMManager::HasValidVM())
+			return;
+		Error error;
+		std::unique_ptr<ArchiveEntryList> elist = SaveState_DownloadState(&error);
+		if (!elist)
+		{
+			Console.ErrorFmt("retro_serialize: DownloadState failed: {}", error.GetDescription());
+			return;
+		}
+		ok = SaveState_ZipToBuffer(std::move(elist), SaveState_SaveScreenshot(), &buffer, &error);
+		if (!ok)
+			Console.ErrorFmt("retro_serialize: ZipToBuffer failed: {}", error.GetDescription());
+	}, true);
+
+	if (LibretroCore::s_context_ready.load(std::memory_order_acquire))
+		VKLibretro::SetPacing(true);
+
+	if (!ok || buffer.size() > size)
+	{
+		if (ok)
+			log_cb(RETRO_LOG_ERROR, "State (%zu bytes) exceeds serialize buffer (%zu).\n", buffer.size(), size);
+		return false;
+	}
+
+	// Leading u64 length, then the zip. The buffer libretro hands back to
+	// retro_unserialize is the full fixed-size block, so the real length has
+	// to travel inside it.
+	const u64 zip_len = buffer.size();
+	std::memcpy(data, &zip_len, sizeof(zip_len));
+	std::memcpy(static_cast<u8*>(data) + sizeof(zip_len), buffer.data(), buffer.size());
+	return true;
 }
 
 RETRO_API bool retro_unserialize(const void* data, size_t size)
 {
-	return false;
+	if (!VMManager::HasValidVM() || size < sizeof(u64))
+		return false;
+
+	u64 zip_size;
+	std::memcpy(&zip_size, data, sizeof(u64));
+	if (zip_size == 0 || zip_size > size - sizeof(u64))
+		return false;
+
+	VKLibretro::SetPacing(false);
+
+	bool ok = false;
+	const u8* zip_data = static_cast<const u8*>(data) + sizeof(u64);
+	Host::RunOnCPUThread([zip_data, zip_size, &ok]() {
+		if (!VMManager::HasValidVM())
+			return;
+		Error error;
+		ok = SaveState_UnzipFromBuffer(zip_data, static_cast<size_t>(zip_size), &error);
+		if (!ok)
+			Console.ErrorFmt("retro_unserialize failed: {}", error.GetDescription());
+	}, true);
+
+	if (LibretroCore::s_context_ready.load(std::memory_order_acquire))
+		VKLibretro::SetPacing(true);
+
+	return ok;
 }
 
 RETRO_API void retro_cheat_reset(void)
