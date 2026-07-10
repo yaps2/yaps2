@@ -2541,41 +2541,51 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 	// If we're running surfaceless, kick the command buffer so we don't run out of descriptors.
 	if (!m_swap_chain)
 	{
-		// Libretro handoff: instead of drawing to a swapchain, copy the merged
-		// display texture into a dedicated backbuffer and hand that to the
-		// frontend. m_current itself is pooled and can be recycled while the
-		// frontend still samples the view (cached-frame replay), so the copy
-		// is what keeps the handed-out image stable.
-		if (VKLibretro::Active && m_current)
+		// Libretro: run a REAL present targeting a dedicated backbuffer, so
+		// the whole normal path (PresentRect aspect-correct draw, TV shaders,
+		// FullscreenUI, ImGui OSD in EndPresent) works unchanged; EndPresent
+		// then hands the finished image to the frontend. The backbuffers are
+		// owned outside the texture pool because the frontend keeps sampling
+		// the published view for cached-frame replays.
+		if (VKLibretro::Active)
 		{
-			GSTextureVK* cur = static_cast<GSTextureVK*>(m_current);
+			const GSVector2i pres = GetPresentationSize();
 			std::unique_ptr<GSTextureVK>& bb = s_libretro_bb[s_libretro_bb_idx];
-			if (!bb || bb->GetWidth() != cur->GetWidth() || bb->GetHeight() != cur->GetHeight() ||
-				bb->GetFormat() != cur->GetFormat())
+			if (!bb || bb->GetWidth() != pres.x || bb->GetHeight() != pres.y)
 			{
-				// The frontend may still replay the old image (e.g. its menu
-				// re-presents the last frame indefinitely), so it must stay
-				// alive for the rest of the session -- retire, don't destroy.
+				// The frontend may still replay the displaced image
+				// indefinitely -- retire, don't destroy.
 				if (bb)
 					s_libretro_bb_retired.push_back(std::move(bb));
-				bb = GSTextureVK::Create(GSTexture::Type::RenderTarget, cur->GetFormat(),
-					cur->GetWidth(), cur->GetHeight(), 1);
+				bb = GSTextureVK::Create(GSTexture::Type::RenderTarget, GSTexture::Format::Color,
+					pres.x, pres.y, 1);
 			}
 			if (bb)
 			{
-				s_libretro_bb_idx = (s_libretro_bb_idx + 1) % kLibretroBackbuffers;
-				CopyRect(cur, bb.get(), GSVector4i(0, 0, cur->GetWidth(), cur->GetHeight()), 0, 0);
-				bb->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
-				ExecuteCommandBuffer(false);
+				VkCommandBuffer cmdbuffer = GetCurrentCommandBuffer();
+				if (!frame_skip && m_current)
+					static_cast<GSTextureVK*>(m_current)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+				bb->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::ColorAttachment);
 
-				VKLibretro::Frame frame;
-				frame.image = bb->GetImage();
-				frame.view = bb->GetView();
-				frame.format = bb->GetVkFormat();
-				frame.width = static_cast<u32>(bb->GetWidth());
-				frame.height = static_cast<u32>(bb->GetHeight());
-				VKLibretro::PublishFrame(frame);
-				return PresentResult::FrameSkipped;
+				const VkFramebuffer fb = bb->GetFramebuffer(false);
+				if (fb != VK_NULL_HANDLE)
+				{
+					const VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr,
+						GetRenderPass(bb->GetVkFormat(), VK_FORMAT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_CLEAR,
+							VK_ATTACHMENT_STORE_OP_STORE),
+						fb, {{0, 0}, {static_cast<u32>(bb->GetWidth()), static_cast<u32>(bb->GetHeight())}},
+						1u, &s_present_clear_color};
+					vkCmdBeginRenderPass(cmdbuffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+					const VkViewport vp{0.0f, 0.0f, static_cast<float>(bb->GetWidth()),
+						static_cast<float>(bb->GetHeight()), 0.0f, 1.0f};
+					const VkRect2D scissor{
+						{0, 0}, {static_cast<u32>(bb->GetWidth()), static_cast<u32>(bb->GetHeight())}};
+					vkCmdSetViewport(cmdbuffer, 0, 1, &vp);
+					vkCmdSetScissor(cmdbuffer, 0, 1, &scissor);
+					m_is_presenting = true;
+					return PresentResult::OK;
+				}
 			}
 		}
 
@@ -2660,6 +2670,30 @@ void GSDeviceVK::EndPresent()
 	VkCommandBuffer cmdbuffer = GetCurrentCommandBuffer();
 	vkCmdEndRenderPass(cmdbuffer);
 	m_is_presenting = false;
+
+	if (VKLibretro::Active && !m_swap_chain)
+	{
+		// Libretro: finish the backbuffer, submit without any swapchain
+		// semantics, and hand the image to the frontend.
+		GSTextureVK* bb = s_libretro_bb[s_libretro_bb_idx].get();
+		bb->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::ShaderReadOnly);
+		g_perfmon.Put(GSPerfMon::RenderPasses, 1);
+
+		SubmitCommandBuffer(static_cast<VKSwapChain*>(nullptr));
+		MoveToNextCommandBuffer();
+		InvalidateCachedState();
+
+		VKLibretro::Frame frame;
+		frame.image = bb->GetImage();
+		frame.view = bb->GetView();
+		frame.format = bb->GetVkFormat();
+		frame.width = static_cast<u32>(bb->GetWidth());
+		frame.height = static_cast<u32>(bb->GetHeight());
+		s_libretro_bb_idx = (s_libretro_bb_idx + 1) % kLibretroBackbuffers;
+		VKLibretro::PublishFrame(frame);
+		return;
+	}
+
 	m_swap_chain->GetCurrentTexture()->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::PresentSrc);
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
 

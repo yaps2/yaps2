@@ -833,6 +833,7 @@ static const struct retro_variable kCoreVariables[] = {
 	{"yaps2_upscale", "Internal resolution; 1x|2x|3x|4x"},
 	{"yaps2_fast_boot", "Fast boot; enabled|disabled"},
 	{"yaps2_widescreen_patches", "Widescreen patches (restart); disabled|enabled"},
+	{"yaps2_show_fps", "Show FPS on screen; disabled|enabled"},
 	{nullptr, nullptr},
 };
 
@@ -866,6 +867,10 @@ static void ApplyCoreOptions(bool startup)
 		var = {"yaps2_widescreen_patches", nullptr};
 		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
 			s_base_settings->SetBoolValue("EmuCore", "EnableWideScreenPatches", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_show_fps", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore/GS", "OsdShowFPS", !std::strcmp(var.value, "enabled"));
 	}
 
 	if (startup)
