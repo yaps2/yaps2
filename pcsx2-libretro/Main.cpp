@@ -1375,10 +1375,10 @@ RETRO_API bool retro_serialize(void* data, size_t size)
 	if (LibretroCore::s_context_ready.load(std::memory_order_acquire))
 		VKLibretro::SetPacing(true);
 
-	if (!ok || buffer.size() > size)
+	if (!ok || sizeof(u64) + buffer.size() > size)
 	{
 		if (ok)
-			log_cb(RETRO_LOG_ERROR, "State (%zu bytes) exceeds serialize buffer (%zu).\n", buffer.size(), size);
+			log_cb(RETRO_LOG_ERROR, "State (8+%zu bytes) exceeds serialize buffer (%zu).\n", buffer.size(), size);
 		return false;
 	}
 
