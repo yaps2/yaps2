@@ -367,7 +367,10 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs()
 	}
 	else
 	{
-		if (Vulkan::LoadVulkanLibrary(nullptr))
+		// The library may already be loaded by the host (libretro preloads it
+		// for the context negotiation) — use it, and don't unload it after.
+		const bool library_was_loaded = Vulkan::IsVulkanLibraryLoaded();
+		if (library_was_loaded || Vulkan::LoadVulkanLibrary(nullptr))
 		{
 			OptionalExtensions oe = {};
 			const VkInstance instance = CreateVulkanInstance(WindowInfo(), &oe, false, false);
@@ -379,7 +382,8 @@ GSDeviceVK::GPUList GSDeviceVK::EnumerateGPUs()
 				vkDestroyInstance(instance, nullptr);
 			}
 
-			Vulkan::UnloadVulkanLibrary();
+			if (!library_was_loaded)
+				Vulkan::UnloadVulkanLibrary();
 		}
 	}
 
