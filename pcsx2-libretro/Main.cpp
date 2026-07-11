@@ -872,6 +872,22 @@ static struct retro_core_option_v2_definition kOptionDefinitions[] = {
 		nullptr, "video",
 		{{"Minimum", nullptr}, {"Basic", nullptr}, {"Medium", nullptr}, {"High", nullptr},
 			{"Full", nullptr}, {"Maximum", nullptr}, {nullptr, nullptr}}, "Basic"},
+	{"yaps2_texture_filtering", "Texture Filtering", "Texture Filtering",
+		"Bilinear (PS2) filters as the game requests. Forced filters everything, which smooths textures "
+		"but can blur 2D elements; the sprite-excluding variant protects UI sprites.",
+		nullptr, "video",
+		{{"Nearest", nullptr}, {"Bilinear (Forced)", nullptr}, {"Bilinear (PS2)", nullptr},
+			{"Bilinear (Forced excluding sprites)", nullptr}, {nullptr, nullptr}}, "Bilinear (PS2)"},
+	{"yaps2_anisotropic_filtering", "Anisotropic Filtering", "Anisotropic Filtering",
+		"Sharpens textures viewed at an angle. Cheap on the GPU, but can cause artifacts in games that "
+		"rely on point sampling.",
+		nullptr, "video",
+		{{"0", "disabled"}, {"2", "2x"}, {"4", "4x"}, {"8", "8x"}, {"16", "16x"}, {nullptr, nullptr}}, "0"},
+	{"yaps2_sw_threads", "Software Renderer Threads", "Software Renderer Threads",
+		"Worker threads for the Software renderer (in addition to the GS thread). No effect on Vulkan.",
+		nullptr, "video",
+		{{"0", nullptr}, {"1", nullptr}, {"2", nullptr}, {"3", nullptr}, {"4", nullptr},
+			{nullptr, nullptr}}, "2"},
 	{"yaps2_show_fps", "Show FPS", "Show FPS",
 		"Draws the internal framerate on screen.",
 		nullptr, "video",
@@ -888,17 +904,42 @@ static struct retro_core_option_v2_definition kOptionDefinitions[] = {
 		nullptr, "performance",
 		{{"disabled", nullptr}, {"mild", nullptr}, {"moderate", nullptr}, {"maximum", nullptr},
 			{nullptr, nullptr}}, "disabled"},
+	{"yaps2_hw_download_mode", "Hardware Download Mode", "Hardware Download Mode",
+		"How GS-to-EE readbacks are handled. Accurate is correct but expensive on mobile GPUs; "
+		"Disable Readbacks skips the data copy, Unsynchronized doesn't wait for the GPU, Disabled "
+		"ignores the transfer entirely. Anything but Accurate can break effects that read the framebuffer.",
+		nullptr, "performance",
+		{{"Accurate", nullptr}, {"Disable Readbacks", nullptr}, {"Unsynchronized", nullptr},
+			{"Disabled", nullptr}, {nullptr, nullptr}}, "Accurate"},
+	{"yaps2_mtvu", "MTVU (Multi-Threaded VU1)", "MTVU (Multi-Threaded VU1)",
+		"Runs VU1 on its own thread. Large speedup on multi-core CPUs; a small number of games hang with it.",
+		nullptr, "performance",
+		{{"enabled", nullptr}, {"disabled", nullptr}, {nullptr, nullptr}}, "enabled"},
+	{"yaps2_instant_vu1", "Instant VU1", "Instant VU1",
+		"Runs VU1 programs to completion instantly instead of interleaving with the EE. "
+		"Fast and safe for most games.",
+		nullptr, "performance",
+		{{"enabled", nullptr}, {"disabled", nullptr}, {nullptr, nullptr}}, "enabled"},
+	{"yaps2_bios", "BIOS (restart)", "BIOS (restart)",
+		"Which BIOS image from <system>/pcsx2/bios to boot. Auto picks the first valid image.",
+		nullptr, "system",
+		{{"auto", "Auto (first valid image)"}, {nullptr, nullptr}}, "auto"},
 	{"yaps2_fast_boot", "Fast Boot", "Fast Boot",
 		"Skips the BIOS boot animation.",
 		nullptr, "system",
 		{{"enabled", nullptr}, {"disabled", nullptr}, {nullptr, nullptr}}, "enabled"},
+	{"yaps2_cheats", "Enable Cheats", "Enable Cheats",
+		"Loads .pnach cheat files from <system>/pcsx2/cheats for the running game.",
+		nullptr, "system",
+		{{"disabled", nullptr}, {"enabled", nullptr}, {nullptr, nullptr}}, "disabled"},
 	{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {{nullptr, nullptr}}, nullptr},
 };
 
 static struct retro_core_options_v2 kOptionsV2 = {kOptionCategories, kOptionDefinitions};
 
-// Legacy fallback: first value doubles as the default.
-static const struct retro_variable kCoreVariables[] = {
+// Legacy fallback: first value doubles as the default. Non-const so the
+// BIOS entry can be pointed at the scanned list.
+static struct retro_variable kCoreVariables[] = {
 	{"yaps2_renderer", "GS renderer (restart); Vulkan|Software"},
 	{"yaps2_upscale", "Internal resolution; 1x|2x|3x|4x"},
 	{"yaps2_aspect_ratio", "Aspect ratio; Auto 4:3/3:2|4:3|16:9|Stretch"},
@@ -906,12 +947,78 @@ static const struct retro_variable kCoreVariables[] = {
 	{"yaps2_no_interlacing_patches", "No-interlacing patches (restart); disabled|enabled"},
 	{"yaps2_widescreen_patches", "Widescreen patches (restart); disabled|enabled"},
 	{"yaps2_blending_accuracy", "Blending accuracy; Basic|Minimum|Medium|High|Full|Maximum"},
+	{"yaps2_texture_filtering", "Texture filtering; Bilinear (PS2)|Nearest|Bilinear (Forced)|Bilinear (Forced excluding sprites)"},
+	{"yaps2_anisotropic_filtering", "Anisotropic filtering; 0|2|4|8|16"},
+	{"yaps2_sw_threads", "Software renderer threads; 2|0|1|3|4"},
 	{"yaps2_show_fps", "Show FPS on screen; disabled|enabled"},
 	{"yaps2_ee_cycle_rate", "EE cycle rate; 100%|50%|60%|75%|130%|180%|300%"},
 	{"yaps2_ee_cycle_skip", "EE cycle skip; disabled|mild|moderate|maximum"},
+	{"yaps2_hw_download_mode", "Hardware download mode; Accurate|Disable Readbacks|Unsynchronized|Disabled"},
+	{"yaps2_mtvu", "MTVU (multi-threaded VU1); enabled|disabled"},
+	{"yaps2_instant_vu1", "Instant VU1; enabled|disabled"},
+	{"yaps2_bios", "BIOS (restart); auto"},
 	{"yaps2_fast_boot", "Fast boot; enabled|disabled"},
+	{"yaps2_cheats", "Enable cheats; disabled|enabled"},
 	{nullptr, nullptr},
 };
+
+// BIOS images found under <system>/pcsx2/bios, scanned when the frontend
+// registers the options. The vector owns the value strings; the option
+// tables point into it.
+static std::vector<std::string> s_bios_images;
+static std::string s_bios_legacy_values;
+
+static void PopulateBiosOptions(retro_environment_t cb)
+{
+	if (!s_bios_images.empty())
+		return;
+
+	const char* system_dir = nullptr;
+	if (!cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir) || !system_dir)
+		return;
+
+	FileSystem::FindResultsArray files;
+	FileSystem::FindFiles(Path::Combine(system_dir, "pcsx2/bios").c_str(), "*",
+		FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_HIDDEN_FILES, &files);
+	for (const FILESYSTEM_FIND_DATA& fd : files)
+	{
+		if (!StringUtil::EndsWithNoCase(fd.FileName, ".bin"))
+			continue;
+		s_bios_images.push_back(std::string(Path::GetFileName(fd.FileName)));
+	}
+	std::sort(s_bios_images.begin(), s_bios_images.end());
+
+	retro_core_option_v2_definition* bios_def = nullptr;
+	for (retro_core_option_v2_definition& def : kOptionDefinitions)
+	{
+		if (def.key && !std::strcmp(def.key, "yaps2_bios"))
+		{
+			bios_def = &def;
+			break;
+		}
+	}
+	if (!bios_def)
+		return;
+
+	s_bios_legacy_values = "BIOS (restart); auto";
+	// values[0] is "auto", the last slot stays the terminator.
+	const size_t max_values = std::size(bios_def->values) - 2;
+	for (size_t i = 0; i < s_bios_images.size() && i < max_values; i++)
+	{
+		bios_def->values[i + 1] = {s_bios_images[i].c_str(), nullptr};
+		s_bios_legacy_values += '|';
+		s_bios_legacy_values += s_bios_images[i];
+	}
+
+	for (retro_variable& var : kCoreVariables)
+	{
+		if (var.key && !std::strcmp(var.key, "yaps2_bios"))
+		{
+			var.value = s_bios_legacy_values.c_str();
+			break;
+		}
+	}
+}
 
 static void ApplyCoreOptions(bool startup)
 {
@@ -1018,6 +1125,69 @@ static void ApplyCoreOptions(bool startup)
 				}
 			}
 		}
+
+		var = {"yaps2_texture_filtering", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Indices match the BiFiltering enum.
+			static constexpr const char* kFilters[] = {"Nearest", "Bilinear (Forced)", "Bilinear (PS2)",
+				"Bilinear (Forced excluding sprites)"};
+			for (size_t i = 0; i < std::size(kFilters); i++)
+			{
+				if (!std::strcmp(var.value, kFilters[i]))
+				{
+					s_base_settings->SetIntValue("EmuCore/GS", "filter", static_cast<int>(i));
+					break;
+				}
+			}
+		}
+
+		var = {"yaps2_anisotropic_filtering", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetIntValue("EmuCore/GS", "MaxAnisotropy", std::clamp(atoi(var.value), 0, 16));
+
+		var = {"yaps2_sw_threads", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetIntValue("EmuCore/GS", "extrathreads", std::clamp(atoi(var.value), 0, 4));
+
+		var = {"yaps2_hw_download_mode", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Explicit values: EnabledForceFull (1) is deliberately not exposed.
+			static constexpr std::pair<const char*, GSHardwareDownloadMode> kModes[] = {
+				{"Accurate", GSHardwareDownloadMode::Enabled},
+				{"Disable Readbacks", GSHardwareDownloadMode::NoReadbacks},
+				{"Unsynchronized", GSHardwareDownloadMode::Unsynchronized},
+				{"Disabled", GSHardwareDownloadMode::Disabled}};
+			for (const auto& [name, value] : kModes)
+			{
+				if (!std::strcmp(var.value, name))
+				{
+					s_base_settings->SetIntValue("EmuCore/GS", "HWDownloadMode", static_cast<int>(value));
+					break;
+				}
+			}
+		}
+
+		var = {"yaps2_mtvu", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore/Speedhacks", "vuThread", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_instant_vu1", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore/Speedhacks", "vu1Instant", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_bios", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Empty setting = FindBiosImage() picks the first valid image.
+			s_base_settings->SetStringValue("Filenames", "BIOS",
+				std::strcmp(var.value, "auto") ? var.value : "");
+		}
+
+		var = {"yaps2_cheats", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore", "EnableCheats", !std::strcmp(var.value, "enabled"));
 	}
 
 	if (startup)
@@ -1126,6 +1296,8 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
 	bool support_no_game = false;
 	cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &support_no_game);
+
+	PopulateBiosOptions(cb);
 
 	unsigned options_version = 0;
 	if (cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &options_version) && options_version >= 2)
