@@ -1036,8 +1036,8 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info)
 	std::memset(info, 0, sizeof(*info));
 	info->geometry.base_width = LibretroCore::kFrameWidth;
 	info->geometry.base_height = LibretroCore::kFrameHeight;
-	info->geometry.max_width = 1920;
-	info->geometry.max_height = 1080;
+	info->geometry.max_width = VKLibretro::kMaxCanvasWidth;
+	info->geometry.max_height = VKLibretro::kMaxCanvasHeight;
 	info->geometry.aspect_ratio = 4.0f / 3.0f;
 	info->timing.fps = 59.94;
 	info->timing.sample_rate = 48000.0;
@@ -1260,6 +1260,24 @@ RETRO_API void retro_run(void)
 		auto* vulkan = static_cast<retro_hw_render_interface_vulkan*>(VKLibretro::GetHWRenderInterface());
 		if (vulkan && VKLibretro::ConsumeFrame(&frame))
 		{
+			// The GS present path sizes the canvas to the (aspect-expanded)
+			// merged frame, so it changes with the internal resolution — keep
+			// the frontend's geometry in sync so scaling stays correct.
+			static u32 last_geometry_width = 0;
+			static u32 last_geometry_height = 0;
+			if (frame.width != last_geometry_width || frame.height != last_geometry_height)
+			{
+				last_geometry_width = frame.width;
+				last_geometry_height = frame.height;
+				retro_game_geometry geometry = {};
+				geometry.base_width = frame.width;
+				geometry.base_height = frame.height;
+				geometry.max_width = VKLibretro::kMaxCanvasWidth;
+				geometry.max_height = VKLibretro::kMaxCanvasHeight;
+				// The canvas is already aspect-corrected; display it 1:1.
+				geometry.aspect_ratio = static_cast<float>(frame.width) / static_cast<float>(frame.height);
+				environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+			}
 			static retro_vulkan_image vkimage;
 			vkimage = {};
 			vkimage.image_view = frame.view;

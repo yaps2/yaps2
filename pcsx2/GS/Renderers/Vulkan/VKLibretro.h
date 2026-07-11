@@ -28,6 +28,13 @@ namespace VKLibretro
 	// GSDeviceVK during init/present.
 	extern bool Active;
 
+	// Largest output canvas the core will produce: 4x-upscaled PAL expanded
+	// to 4:3. Advertised to the frontend as retro_game_geometry
+	// max_width/max_height and enforced when the present path sizes the
+	// canvas to the merged frame.
+	static constexpr u32 kMaxCanvasWidth = 2732;
+	static constexpr u32 kMaxCanvasHeight = 2048;
+
 	struct InitInfo
 	{
 		VkInstance instance = VK_NULL_HANDLE;

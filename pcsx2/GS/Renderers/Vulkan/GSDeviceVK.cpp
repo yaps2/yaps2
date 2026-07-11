@@ -2438,8 +2438,18 @@ void GSDeviceVK::ResizeWindow(u32 new_window_width, u32 new_window_height, float
 {
 	m_resize_requested = false;
 
-	if (!m_swap_chain || (m_swap_chain->GetWidth() == new_window_width &&
-							 m_swap_chain->GetHeight() == new_window_height))
+	if (!m_swap_chain)
+	{
+		// Surfaceless (libretro): the "window" is the backbuffer rendered for
+		// the frontend, so just adopt the new size — BeginPresent recreates
+		// the backbuffer to match on the next frame.
+		m_window_info.surface_width = new_window_width;
+		m_window_info.surface_height = new_window_height;
+		m_window_info.surface_scale = new_window_scale;
+		return;
+	}
+
+	if (m_swap_chain->GetWidth() == new_window_width && m_swap_chain->GetHeight() == new_window_height)
 	{
 		// skip unnecessary resizes
 		m_window_info.surface_scale = new_window_scale;
