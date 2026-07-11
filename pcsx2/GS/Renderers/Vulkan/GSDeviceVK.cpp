@@ -2375,8 +2375,12 @@ void GSDeviceVK::Destroy()
 
 	VKShaderCache::Destroy();
 
+	// The negotiated device belongs to the libretro frontend (it made the
+	// vkCreateDevice call) and it destroys it after context_destroy —
+	// destroying it here would leave the frontend tearing down a dead device.
 	if (m_device != VK_NULL_HANDLE)
-		vkDestroyDevice(m_device, nullptr);
+		if (!(VKLibretro::Active && VKLibretro::Init.device == m_device))
+			vkDestroyDevice(m_device, nullptr);
 
 	if (m_debug_messenger_callback != VK_NULL_HANDLE)
 		DisableDebugUtils();

@@ -1490,6 +1490,15 @@ RETRO_API bool retro_load_game_special(unsigned game_type, const struct retro_ga
 
 RETRO_API void retro_unload_game(void)
 {
+	// The frontend replays the last set_image indefinitely (menu background,
+	// duped frames) — retract it and wait for the GPU before the VM teardown
+	// below destroys the textures it points at.
+	if (auto* vulkan = static_cast<retro_hw_render_interface_vulkan*>(VKLibretro::GetHWRenderInterface()))
+	{
+		vulkan->set_image(vulkan->handle, nullptr, 0, nullptr, vulkan->queue_index);
+		vulkan->wait_sync_index(vulkan->handle);
+	}
+
 	VKLibretro::AbortPacing(); // GS thread may be parked in PublishFrame
 	s_shutdown_requested.store(true, std::memory_order_release);
 	if (VMManager::HasValidVM())
