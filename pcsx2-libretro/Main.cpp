@@ -825,15 +825,91 @@ static std::string LoadM3UPlaylist(const std::string& m3u_path)
 
 //////////////////////////////////////////////////////////////////////////
 // Core options (M4). Applied at load and re-applied on change notifications
-// from the frontend; ApplySettings runs on the CPU thread.
+// from the frontend; ApplySettings runs on the CPU thread. Registered as
+// core options v2 (categorised), with the flat retro_variable list kept as
+// the fallback for frontends that only speak the legacy API.
 //////////////////////////////////////////////////////////////////////////
 
+static struct retro_core_option_v2_category kOptionCategories[] = {
+	{"video", "Video", "Rendering, scaling and display options."},
+	{"performance", "Performance", "Speed hacks trading accuracy for framerate."},
+	{"system", "System", "Boot behaviour."},
+	{nullptr, nullptr, nullptr},
+};
+
+static struct retro_core_option_v2_definition kOptionDefinitions[] = {
+	{"yaps2_renderer", "GS Renderer (restart)", "GS Renderer (restart)",
+		"Vulkan renders the GS on the GPU. Software renders on the CPU and presents through the same shared Vulkan context.",
+		nullptr, "video",
+		{{"Vulkan", nullptr}, {"Software", nullptr}, {nullptr, nullptr}}, "Vulkan"},
+	{"yaps2_upscale", "Internal Resolution", "Internal Resolution",
+		"Renders the PS2 output at a multiple of native resolution. The output canvas follows this size.",
+		nullptr, "video",
+		{{"1x", "1x (native)"}, {"2x", nullptr}, {"3x", nullptr}, {"4x", nullptr}, {nullptr, nullptr}}, "1x"},
+	{"yaps2_aspect_ratio", "Aspect Ratio", "Aspect Ratio",
+		"Display aspect ratio. 16:9 is intended for games with widescreen patches or native widescreen modes.",
+		nullptr, "video",
+		{{"Auto 4:3/3:2", "Auto (4:3 / 3:2 progressive)"}, {"4:3", nullptr}, {"16:9", nullptr},
+			{"Stretch", nullptr}, {nullptr, nullptr}}, "Auto 4:3/3:2"},
+	{"yaps2_deinterlacing", "Deinterlacing", "Deinterlacing",
+		"How interlaced (480i/576i) output is turned into a full frame. Automatic picks per game; "
+		"Bob is fast, Adaptive is highest quality; Off shows the raw field.",
+		nullptr, "video",
+		{{"Automatic", nullptr}, {"Off", nullptr}, {"Weave TFF", nullptr}, {"Weave BFF", nullptr},
+			{"Bob TFF", nullptr}, {"Bob BFF", nullptr}, {"Blend TFF", nullptr}, {"Blend BFF", nullptr},
+			{"Adaptive TFF", nullptr}, {"Adaptive BFF", nullptr}, {nullptr, nullptr}}, "Automatic"},
+	{"yaps2_no_interlacing_patches", "No-Interlacing Patches (restart)", "No-Interlacing Patches (restart)",
+		"Patches supported games to render progressive instead of interlaced — sharper than any deinterlacer.",
+		nullptr, "video",
+		{{"disabled", nullptr}, {"enabled", nullptr}, {nullptr, nullptr}}, "disabled"},
+	{"yaps2_widescreen_patches", "Widescreen Patches (restart)", "Widescreen Patches (restart)",
+		"Patches supported games to render 16:9. Set Aspect Ratio to 16:9 alongside this.",
+		nullptr, "video",
+		{{"disabled", nullptr}, {"enabled", nullptr}, {nullptr, nullptr}}, "disabled"},
+	{"yaps2_blending_accuracy", "Blending Accuracy", "Blending Accuracy",
+		"How accurately PS2 framebuffer blending is emulated on the GPU. Lower levels are faster; "
+		"raise it only for games with visible blending artifacts.",
+		nullptr, "video",
+		{{"Minimum", nullptr}, {"Basic", nullptr}, {"Medium", nullptr}, {"High", nullptr},
+			{"Full", nullptr}, {"Maximum", nullptr}, {nullptr, nullptr}}, "Basic"},
+	{"yaps2_show_fps", "Show FPS", "Show FPS",
+		"Draws the internal framerate on screen.",
+		nullptr, "video",
+		{{"disabled", nullptr}, {"enabled", nullptr}, {nullptr, nullptr}}, "disabled"},
+	{"yaps2_ee_cycle_rate", "EE Cycle Rate", "EE Cycle Rate",
+		"Underclocks or overclocks the emulated Emotion Engine. Below 100% speeds up emulation but can "
+		"cause stutter or breakage; above 100% can smooth out games with internal slowdown.",
+		nullptr, "performance",
+		{{"50%", nullptr}, {"60%", nullptr}, {"75%", nullptr}, {"100%", "100% (default)"},
+			{"130%", nullptr}, {"180%", nullptr}, {"300%", nullptr}, {nullptr, nullptr}}, "100%"},
+	{"yaps2_ee_cycle_skip", "EE Cycle Skip", "EE Cycle Skip",
+		"Makes the emulated EE skip cycles. Helps games with obvious VU-driven slowdown; "
+		"can cause false FPS readings and breakage.",
+		nullptr, "performance",
+		{{"disabled", nullptr}, {"mild", nullptr}, {"moderate", nullptr}, {"maximum", nullptr},
+			{nullptr, nullptr}}, "disabled"},
+	{"yaps2_fast_boot", "Fast Boot", "Fast Boot",
+		"Skips the BIOS boot animation.",
+		nullptr, "system",
+		{{"enabled", nullptr}, {"disabled", nullptr}, {nullptr, nullptr}}, "enabled"},
+	{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {{nullptr, nullptr}}, nullptr},
+};
+
+static struct retro_core_options_v2 kOptionsV2 = {kOptionCategories, kOptionDefinitions};
+
+// Legacy fallback: first value doubles as the default.
 static const struct retro_variable kCoreVariables[] = {
 	{"yaps2_renderer", "GS renderer (restart); Vulkan|Software"},
 	{"yaps2_upscale", "Internal resolution; 1x|2x|3x|4x"},
-	{"yaps2_fast_boot", "Fast boot; enabled|disabled"},
+	{"yaps2_aspect_ratio", "Aspect ratio; Auto 4:3/3:2|4:3|16:9|Stretch"},
+	{"yaps2_deinterlacing", "Deinterlacing; Automatic|Off|Weave TFF|Weave BFF|Bob TFF|Bob BFF|Blend TFF|Blend BFF|Adaptive TFF|Adaptive BFF"},
+	{"yaps2_no_interlacing_patches", "No-interlacing patches (restart); disabled|enabled"},
 	{"yaps2_widescreen_patches", "Widescreen patches (restart); disabled|enabled"},
+	{"yaps2_blending_accuracy", "Blending accuracy; Basic|Minimum|Medium|High|Full|Maximum"},
 	{"yaps2_show_fps", "Show FPS on screen; disabled|enabled"},
+	{"yaps2_ee_cycle_rate", "EE cycle rate; 100%|50%|60%|75%|130%|180%|300%"},
+	{"yaps2_ee_cycle_skip", "EE cycle skip; disabled|mild|moderate|maximum"},
+	{"yaps2_fast_boot", "Fast boot; enabled|disabled"},
 	{nullptr, nullptr},
 };
 
@@ -871,6 +947,77 @@ static void ApplyCoreOptions(bool startup)
 		var = {"yaps2_show_fps", nullptr};
 		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
 			s_base_settings->SetBoolValue("EmuCore/GS", "OsdShowFPS", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_aspect_ratio", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Option values match Pcsx2Config::GSOptions::AspectRatioNames.
+			s_base_settings->SetStringValue("EmuCore/GS", "AspectRatio", var.value);
+		}
+
+		var = {"yaps2_deinterlacing", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Indices match the GSInterlaceMode enum.
+			static constexpr const char* kModes[] = {"Automatic", "Off", "Weave TFF", "Weave BFF",
+				"Bob TFF", "Bob BFF", "Blend TFF", "Blend BFF", "Adaptive TFF", "Adaptive BFF"};
+			for (size_t i = 0; i < std::size(kModes); i++)
+			{
+				if (!std::strcmp(var.value, kModes[i]))
+				{
+					s_base_settings->SetIntValue("EmuCore/GS", "deinterlace_mode", static_cast<int>(i));
+					break;
+				}
+			}
+		}
+
+		var = {"yaps2_no_interlacing_patches", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+			s_base_settings->SetBoolValue("EmuCore", "EnableNoInterlacingPatches", !std::strcmp(var.value, "enabled"));
+
+		var = {"yaps2_blending_accuracy", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			// Indices match the AccBlendLevel enum.
+			static constexpr const char* kLevels[] = {"Minimum", "Basic", "Medium", "High", "Full", "Maximum"};
+			for (size_t i = 0; i < std::size(kLevels); i++)
+			{
+				if (!std::strcmp(var.value, kLevels[i]))
+				{
+					s_base_settings->SetIntValue("EmuCore/GS", "accurate_blending_unit", static_cast<int>(i));
+					break;
+				}
+			}
+		}
+
+		var = {"yaps2_ee_cycle_rate", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			static constexpr std::pair<const char*, int> kRates[] = {{"50%", -3}, {"60%", -2}, {"75%", -1},
+				{"100%", 0}, {"130%", 1}, {"180%", 2}, {"300%", 3}};
+			for (const auto& [name, value] : kRates)
+			{
+				if (!std::strcmp(var.value, name))
+				{
+					s_base_settings->SetIntValue("EmuCore/Speedhacks", "EECycleRate", value);
+					break;
+				}
+			}
+		}
+
+		var = {"yaps2_ee_cycle_skip", nullptr};
+		if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		{
+			static constexpr const char* kSkips[] = {"disabled", "mild", "moderate", "maximum"};
+			for (size_t i = 0; i < std::size(kSkips); i++)
+			{
+				if (!std::strcmp(var.value, kSkips[i]))
+				{
+					s_base_settings->SetIntValue("EmuCore/Speedhacks", "EECycleSkip", static_cast<int>(i));
+					break;
+				}
+			}
+		}
 	}
 
 	if (startup)
@@ -980,7 +1127,11 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 	bool support_no_game = false;
 	cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &support_no_game);
 
-	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)kCoreVariables);
+	unsigned options_version = 0;
+	if (cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &options_version) && options_version >= 2)
+		cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &kOptionsV2);
+	else
+		cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)kCoreVariables);
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb)
