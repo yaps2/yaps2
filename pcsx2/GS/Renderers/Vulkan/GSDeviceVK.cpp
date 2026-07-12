@@ -21,9 +21,19 @@ namespace
 	constexpr int kLibretroBackbuffers = 3;
 	std::unique_ptr<GSTextureVK> s_libretro_bb[kLibretroBackbuffers];
 	int s_libretro_bb_idx = 0;
-	// Displaced by a resolution change but possibly still referenced by the
-	// frontend's cached-frame replay; freed only at device teardown.
-	std::vector<std::unique_ptr<GSTextureVK>> s_libretro_bb_retired;
+	// Monotonic count of libretro presents; used to age out retired backbuffers.
+	u64 s_libretro_present_count = 0;
+	// A backbuffer displaced by a resolution change: the frontend may still be
+	// replaying its image for a few frames (cached/duped frames up to its
+	// swapchain depth), so it can't be freed immediately -- but leaving it here
+	// forever leaks a full-resolution render target on every interlace<->
+	// progressive switch (frequent in FMV-heavy games). Each is tagged with the
+	// present count at retirement and reclaimed once enough presents have gone
+	// by that the frontend can no longer reference it.
+	struct RetiredBackbuffer { std::unique_ptr<GSTextureVK> tex; u64 retired_at; };
+	std::vector<RetiredBackbuffer> s_libretro_bb_retired;
+	// Comfortably beyond any libretro frontend's swapchain depth (2-3).
+	constexpr u64 kLibretroRetireFrames = 6;
 } // namespace
 #include "GS/Renderers/Common/GSDevice.h"
 
@@ -2355,6 +2365,7 @@ void GSDeviceVK::Destroy()
 			bb.reset();
 		s_libretro_bb_retired.clear();
 		s_libretro_bb_idx = 0;
+		s_libretro_present_count = 0;
 	}
 
 	std::unique_lock lock(s_instance_mutex);
@@ -2567,14 +2578,21 @@ GSDevice::PresentResult GSDeviceVK::BeginPresent(bool frame_skip)
 		// the published view for cached-frame replays.
 		if (VKLibretro::Active)
 		{
+			// Reclaim backbuffers retired long enough ago that the frontend's
+			// replay window has moved past them (see kLibretroRetireFrames).
+			const u64 now = ++s_libretro_present_count;
+			std::erase_if(s_libretro_bb_retired, [now](const RetiredBackbuffer& r) {
+				return now - r.retired_at >= kLibretroRetireFrames;
+			});
+
 			const GSVector2i pres = GetPresentationSize();
 			std::unique_ptr<GSTextureVK>& bb = s_libretro_bb[s_libretro_bb_idx];
 			if (!bb || bb->GetWidth() != pres.x || bb->GetHeight() != pres.y)
 			{
-				// The frontend may still replay the displaced image
-				// indefinitely -- retire, don't destroy.
+				// The frontend may still replay the displaced image for a few
+				// frames -- retire (freed later above), don't destroy now.
 				if (bb)
-					s_libretro_bb_retired.push_back(std::move(bb));
+					s_libretro_bb_retired.push_back({std::move(bb), now});
 				bb = GSTextureVK::Create(GSTexture::Type::RenderTarget, GSTexture::Format::Color,
 					pres.x, pres.y, 1);
 			}
