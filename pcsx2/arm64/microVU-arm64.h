@@ -77,7 +77,10 @@
 //       badBranch null jumpAddr) now emit a 5-insn inline flag backup
 //       before jumping to exitFunct; blocks carrying those guards change
 //       shape.
-static constexpr u32 kMvuCompilerAbiVersion = 12;
+//  13 — mVUsetupFlags omits status-flag register self-moves at block links
+//       (getFlagReg(i) == gprF[i], so an identity ring phase was emitting
+//       four no-op ORRs); pre-elision link shapes must not be rehydrated.
+static constexpr u32 kMvuCompilerAbiVersion = 13;
 
 // Hash/equality functors for XXH128_hash_t — let std::unordered_map<XXH128_hash_t, …>
 // work without a wrapping struct. low64 already carries the well-mixed half of
