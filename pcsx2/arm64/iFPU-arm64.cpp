@@ -4,7 +4,10 @@
 // ARM64 EE FPU (COP1) Instruction Codegen — NEON-based
 // Transfer ops (MFC1/MTC1/CFC1/CTC1): native with NEON allocation.
 // Branch ops (BC1F/BC1T): native, read fprc[31] directly.
-// Arithmetic ops: interpreter fallback (PS2 float clamping needed).
+// Arithmetic ops: native NEON with PS2 clamping and guard-bit ADD/SUB emulation
+//   (fast single-precision path here; the accuracy-mode DOUBLE path is in
+//   iFPUd-arm64.cpp, selected when CHECK_FPU_FULL). Only RSQRT.S still defers to
+//   the interpreter (recFPUCall).
 
 #include "arm64/iR5900-arm64.h"
 
@@ -449,6 +452,127 @@ static a64::VRegister fpuClampInput(const a64::VRegister& src, const a64::VRegis
 	return scratch;
 }
 
+// PS2 add/sub guard-bit emulation for the single-precision fast path.
+//
+// A compliant IEEE FPU keeps "guard" bits to the right of the mantissa during
+// add/sub; the EE FPU does not. On a subtraction (or mixed-sign add) that
+// left-shifts the mantissa, the bits that would have lived in those guard
+// positions must read as zero on hardware. This masks the low mantissa bits of
+// the smaller-exponent operand by the exponent difference, then does the single
+// op. It is the arm64 fast-path port of x86 FPU_ADD_SUB (iFPU.cpp:402, applied
+// unconditionally in the fast path if FPU_CORRECT_ADD_SUB=1) and reproduces the
+// masking already present in the DOUBLE path's FPU_ADD_SUB (iFPUd-arm64.cpp:200).
+// The CHECK_FPU_FULL (double) config dispatches to that path instead and never
+// reaches here.
+//
+// When |expd - expt| <= 1 the mask clears zero bits, so that (common) case skips
+// straight to the plain op. Only |diff| >= 2 masks the smaller-exponent operand;
+// the guest fpr slots (EEREC_S/T/ACC) are never mutated, and s/t may alias dst.
+// result = issub ? (s - t) : (s + t), written to dst.
+//
+// The masking is emitted one of two equivalent ways, chosen at build time by
+// FPU_GUARD_MASK_STUB (iR5900-arm64.h): inlined here, or via a bl to the shared
+// g_fpuGuardMaskStub. Both produce identical results.
+static void fpuEmitGuardedAddSub(const a64::VRegister& dst,
+	const a64::VRegister& s, const a64::VRegister& t, bool issub)
+{
+	armAsm->Fmov(RWARG1, s);                 // s bits (non-destructive read)
+	armAsm->Fmov(RWARG2, t);                 // t bits
+	armAsm->Ubfx(RWARG3, RWARG1, 23, 8);     // expd
+	armAsm->Ubfx(RWSCRATCH, RWARG2, 23, 8);  // expt
+	armAsm->Sub(RWARG3, RWARG3, RWSCRATCH);  // diff = expd - expt (signed)
+
+	const int tmp = _allocTempNEONreg();
+	const a64::VRegister vtmp = armSRegister(tmp);
+
+#if FPU_GUARD_MASK_STUB
+	a64::Label slow, done;
+	armAsm->Cmp(RWARG3, 1);
+	armAsm->B(&slow, a64::gt);                // diff >= 2
+	armAsm->Cmn(RWARG3, 1);
+	armAsm->B(&slow, a64::lt);                // diff <= -2
+	if (issub)                                // -1 <= diff <= 1: no masking
+		armAsm->Fsub(dst, s, t);
+	else
+		armAsm->Fadd(dst, s, t);
+	armAsm->B(&done);
+
+	armAsm->Bind(&slow);
+	// RWARG1/RWARG2 still hold s/t bits; the stub masks them in place
+	// (in: w0=A, w1=B; out: w0=maskedA, w1=maskedB; clobbers w0-w6, x30).
+	armEmitCall(g_fpuGuardMaskStub);
+	armAsm->Fmov(dst, RWARG1);
+	armAsm->Fmov(vtmp, RWARG2);
+	if (issub)
+		armAsm->Fsub(dst, dst, vtmp);
+	else
+		armAsm->Fadd(dst, dst, vtmp);
+	armAsm->Bind(&done);
+#else
+	a64::Label maskT, maskS, plain, done;
+
+	armAsm->Cmp(RWARG3, 1);
+	armAsm->B(&maskT, a64::gt);               // diff >= 2  -> t smaller, mask t
+	armAsm->Cmn(RWARG3, 1);
+	armAsm->B(&maskS, a64::lt);               // diff <= -2 -> s smaller, mask s
+	armAsm->B(&plain);                        // -1 <= diff <= 1 -> mask nothing
+
+	// diff >= 2: mask t's low (diff-1) bits; diff >= 25 keeps only t's sign.
+	armAsm->Bind(&maskT);
+	{
+		a64::Label big, apply;
+		armAsm->Cmp(RWARG3, 25);
+		armAsm->B(&big, a64::ge);
+		armAsm->Sub(RWSCRATCH, RWARG3, 1);
+		armAsm->Mov(RWARG4, 0xffffffff);
+		armAsm->Lsl(RWARG4, RWARG4, RWSCRATCH);
+		armAsm->And(RWARG2, RWARG2, RWARG4);
+		armAsm->B(&apply);
+		armAsm->Bind(&big);
+		armAsm->And(RWARG2, RWARG2, 0x80000000);
+		armAsm->Bind(&apply);
+		armAsm->Fmov(vtmp, RWARG2);
+	}
+	if (issub)
+		armAsm->Fsub(dst, s, vtmp);
+	else
+		armAsm->Fadd(dst, s, vtmp);
+	armAsm->B(&done);
+
+	// diff <= -2: mask s's low (-diff-1) bits; diff <= -25 keeps only s's sign.
+	armAsm->Bind(&maskS);
+	{
+		a64::Label big, apply;
+		armAsm->Cmn(RWARG3, 25);
+		armAsm->B(&big, a64::le);
+		armAsm->Neg(RWSCRATCH, RWARG3);
+		armAsm->Sub(RWSCRATCH, RWSCRATCH, 1);
+		armAsm->Mov(RWARG4, 0xffffffff);
+		armAsm->Lsl(RWARG4, RWARG4, RWSCRATCH);
+		armAsm->And(RWARG1, RWARG1, RWARG4);
+		armAsm->B(&apply);
+		armAsm->Bind(&big);
+		armAsm->And(RWARG1, RWARG1, 0x80000000);
+		armAsm->Bind(&apply);
+		armAsm->Fmov(vtmp, RWARG1);
+	}
+	if (issub)
+		armAsm->Fsub(dst, vtmp, t);
+	else
+		armAsm->Fadd(dst, vtmp, t);
+	armAsm->B(&done);
+
+	armAsm->Bind(&plain);
+	if (issub)
+		armAsm->Fsub(dst, s, t);
+	else
+		armAsm->Fadd(dst, s, t);
+
+	armAsm->Bind(&done);
+#endif
+	_freeNEONreg(tmp);
+}
+
 // FpuMulHack (Tales of Destiny Remake gamefix, EmuConfig.Gamefixes.FpuMulHack).
 // x86 routes every FPU multiply (MUL/MULA/MADD/MSUB) through FPU_MUL, which —
 // when the gamefix is on — patches the single specific product 0.25 * (π/2)
@@ -657,7 +781,7 @@ static void recADD_S_xmm(int info)
 {
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fadd(armSRegister(EEREC_D), s, t);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_D), s, t, false);
 	fpuClampResult(armSRegister(EEREC_D));
 }
 
@@ -671,7 +795,7 @@ static void recSUB_S_xmm(int info)
 {
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fsub(armSRegister(EEREC_D), s, t);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_D), s, t, true);
 	fpuClampResult(armSRegister(EEREC_D));
 }
 
@@ -912,7 +1036,7 @@ static void recADDA_S_xmm(int info)
 {
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fadd(armSRegister(EEREC_ACC), s, t);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), s, t, false);
 	fpuClampResult(armSRegister(EEREC_ACC));
 }
 
@@ -926,7 +1050,7 @@ static void recSUBA_S_xmm(int info)
 {
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fsub(armSRegister(EEREC_ACC), s, t);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), s, t, true);
 	fpuClampResult(armSRegister(EEREC_ACC));
 }
 
@@ -970,7 +1094,7 @@ static void recMADD_S_xmm(int info)
 	// Inf/NaN and that leg is dead on arm64.)
 	if (CHECK_FPU_EXTRA_OVERFLOW)
 		fpuClampResult(RSSCRATCH);
-	armAsm->Fadd(armSRegister(EEREC_D), armSRegister(EEREC_ACC), RSSCRATCH);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_D), armSRegister(EEREC_ACC), RSSCRATCH, false);
 	fpuClampResult(armSRegister(EEREC_D));
 }
 
@@ -989,7 +1113,7 @@ static void recMSUB_S_xmm(int info)
 	// Extra-gated product clamp — x86-JIT parity, see recMADD_S_xmm (GE-19).
 	if (CHECK_FPU_EXTRA_OVERFLOW)
 		fpuClampResult(RSSCRATCH);
-	armAsm->Fsub(armSRegister(EEREC_D), armSRegister(EEREC_ACC), RSSCRATCH);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_D), armSRegister(EEREC_ACC), RSSCRATCH, true);
 	fpuClampResult(armSRegister(EEREC_D));
 }
 
@@ -1014,7 +1138,7 @@ static void recMADDA_S_xmm(int info)
 	emitFpuMul(RSSCRATCH, s, t);
 	if (CHECK_FPU_EXTRA_OVERFLOW)
 		fpuClampResult(RSSCRATCH);
-	armAsm->Fadd(armSRegister(EEREC_ACC), armSRegister(EEREC_ACC), RSSCRATCH);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), armSRegister(EEREC_ACC), RSSCRATCH, false);
 	fpuClampResult(armSRegister(EEREC_ACC));
 }
 
@@ -1033,7 +1157,7 @@ static void recMSUBA_S_xmm(int info)
 	emitFpuMul(RSSCRATCH, s, t);
 	if (CHECK_FPU_EXTRA_OVERFLOW)
 		fpuClampResult(RSSCRATCH);
-	armAsm->Fsub(armSRegister(EEREC_ACC), armSRegister(EEREC_ACC), RSSCRATCH);
+	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), armSRegister(EEREC_ACC), RSSCRATCH, true);
 	fpuClampResult(armSRegister(EEREC_ACC));
 }
 
