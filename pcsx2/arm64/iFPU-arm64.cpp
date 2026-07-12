@@ -6,8 +6,8 @@
 // Branch ops (BC1F/BC1T): native, read fprc[31] directly.
 // Arithmetic ops: native NEON with PS2 clamping and guard-bit ADD/SUB emulation
 //   (fast single-precision path here; the accuracy-mode DOUBLE path is in
-//   iFPUd-arm64.cpp, selected when CHECK_FPU_FULL). Only RSQRT.S still defers to
-//   the interpreter (recFPUCall).
+//   iFPUd-arm64.cpp, selected when CHECK_FPU_FULL). All ops including DIV/SQRT/
+//   RSQRT are native; nothing here defers to the interpreter.
 
 #include "arm64/iR5900-arm64.h"
 
@@ -325,45 +325,6 @@ void recBC1TL()
 #undef _Fd_
 
 #endif // !FORCE_INTERP_FPU
-
-//------------------------------------------------------------------
-// FPU Arithmetic — lightweight interpreter call
-// FPU ops only touch fpuRegs memory, not cpuRegs.GPR. EE GPRs are
-// in callee-saved NEON registers (q8-q15) that survive C calls.
-// Only flush PC/code for exception handling — skip NEON flush.
-//------------------------------------------------------------------
-
-static void recFPUCall(void (*func)())
-{
-	// Flush PC and code (needed if FPU op triggers an exception)
-	armAsm->Mov(RWSCRATCH, pc);
-	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.pc));
-
-	armAsm->Mov(RWSCRATCH, cpuRegs.code);
-	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.code));
-
-	// FPU allocator coherence: the interpreter reads fpuRegs.fpr[] and
-	// fpuRegs.ACC directly, and those values can live in NEON slots
-	// (MODE_WRITE-only) until block-end flush — so writeback every
-	// FPREG/FPACC slot before the call. EE GPRs in callee-saved q8-q15
-	// survive (FPU interpreter doesn't touch cpuRegs.GPR), so iFlushCall's
-	// full eviction is not needed here.
-	for (int i = 0; i < NUM_ARM_NEON_REGS; i++)
-	{
-		if (arm64neon[i].inuse &&
-			(arm64neon[i].type == NEONTYPE_FPREG || arm64neon[i].type == NEONTYPE_FPACC))
-		{
-			_freeNEONreg(i);
-		}
-	}
-
-	armFlushEEClobberedPins(); // lazy-dirty seam: pairs with the reload below
-	armEmitCall((void*)func);
-	// FPU interpreter fallbacks touch fpuRegs only, never cpuRegs.GPR; restore
-	// the caller-saved pins the C call clobbered — the block continues.
-	armReloadEEClobberedPins();
-}
-
 
 #define _Ft_ _Rt_
 #define _Fs_ _Rd_
@@ -984,6 +945,80 @@ void recSQRT_S()
 		XMMINFO_WRITED | XMMINFO_READT);
 }
 
+// Native RSQRT.S: Fd = Fs / sqrt(|Ft|) implemented in the shape of
+// recDIV_S_xmm/recSQRT_S_xmm and matching interp RSQRT_S (FPU.cpp) and
+// x86 recRSQRThelper1 (CHECK_FPU_EXTRA_FLAGS always on):
+//   - Ft exponent field == 0 (zero, including denormals-as-zero): result is
+//     sign(Ft) | 0x7f7fffff (+/-fMax), and set D|SD;
+//   - Ft negative (exp nonzero): set I|SI, then divide by sqrt(|Ft|);
+//   - Ft positive nonzero: divide by sqrt(Ft).
+// I|D are cleared first (sticky SI|SD survive). Like DIV.S/SQRT.S the PS2
+// rounds RSQRT to nearest regardless of the configured FCR31 rounding mode, so
+// swap host FPCR to the nearest-rounding FPUDivFPCR around the sqrt+div and
+// restore FPUFPCR after
+static void recRSQRT_S_xmm(int info)
+{
+	const bool swapFpcr = EmuConfig.Cpu.FPUFPCR.bitmask != EmuConfig.Cpu.FPUDivFPCR.bitmask;
+	if (swapFpcr)
+		emitLoadFPCR(EmuConfig.Cpu.FPUDivFPCR.bitmask);
+
+	// Copy operands into temps: EEREC_D may alias EEREC_S/EEREC_T, and the
+	// zero-divisor path needs the raw Ft sign bit after EEREC_D is written.
+	const int dreg = _allocTempNEONreg();   // dividend Fs
+	const int treg = _allocTempNEONreg();   // divisor, made |Ft| for the sqrt
+	armAsm->Fmov(armSRegister(dreg), armSRegister(EEREC_S));
+	armAsm->Fmov(armSRegister(treg), armSRegister(EEREC_T));
+
+	// Raw Ft bits drive the zero/negative branch and the +/-fMax result sign.
+	armAsm->Fmov(RWARG1, armSRegister(EEREC_T));
+
+	// Clear I|D (sticky SI|SD are left intact).
+	armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+	armAsm->Bic(RWSCRATCH, RWSCRATCH, FPUflagI | FPUflagD);
+	armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+
+	a64::Label notZero, doDiv, end;
+
+	// Ft is treated as zero when its exponent field is 0 (denormals included).
+	armAsm->Tst(RWARG1, 0x7F800000);
+	armAsm->B(&notZero, a64::ne);
+
+	// Zero divisor: set D|SD; result = sign(Ft) | 0x7f7fffff.
+	armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+	armAsm->Orr(RWSCRATCH, RWSCRATCH, FPUflagD | FPUflagSD);
+	armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+	armAsm->And(RWARG1, RWARG1, 0x80000000);
+	armAsm->Orr(RWARG1, RWARG1, 0x7f7fffff);
+	armAsm->Fmov(armSRegister(EEREC_D), RWARG1);
+	armAsm->B(&end);
+
+	armAsm->Bind(&notZero);
+	// Negative divisor (exp nonzero, sign set): set I|SI. sqrt still takes |Ft|.
+	armAsm->Tbz(RWARG1, 31, &doDiv);
+	armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+	armAsm->Orr(RWSCRATCH, RWSCRATCH, FPUflagI | FPUflagSI);
+	armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+
+	armAsm->Bind(&doDiv);
+	armAsm->Fabs(armSRegister(treg), armSRegister(treg)); // |Ft| (no-op if positive)
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+	{
+		fpuClampCompareOperand(armSRegister(dreg));
+		fpuClampCompareOperand(armSRegister(treg));
+	}
+	armAsm->Fsqrt(armSRegister(treg), armSRegister(treg));
+	armAsm->Fdiv(armSRegister(EEREC_D), armSRegister(dreg), armSRegister(treg));
+	fpuClampResult(armSRegister(EEREC_D));
+
+	armAsm->Bind(&end);
+
+	_freeNEONreg(dreg);
+	_freeNEONreg(treg);
+
+	if (swapFpcr)
+		emitLoadFPCR(EmuConfig.Cpu.FPUFPCR.bitmask);
+}
+
 void recRSQRT_S()
 {
 	// GE-20: FULL mode gets the x86 DOUBLE body (widen -> sqrt+div in double,
@@ -994,13 +1029,8 @@ void recRSQRT_S()
 			XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
 		return;
 	}
-	// Fast mode defers to the interpreter: interp RSQRT_S (FPU.cpp) sets D|SD
-	// when Ft (divisor) is zero and I|SI when Ft is negative, and its Ft==0
-	// branch returns ±posFmax keyed off the Ft sign (not Fs) — neither the
-	// sticky flags nor that result shape are reproducible by a raw Fdiv. RSQRT
-	// is rare, so the interpreter call is the lowest-risk match and keeps
-	// emitted code small. Same shape as recDIV_S.
-	recFPUCall(Interp::RSQRT_S);
+	eeFPURecompileCode(recRSQRT_S_xmm, Interp::RSQRT_S,
+		XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
 }
 
 // PS2 FPU has no NaN concept — match x86 MAXSS/MINSS NaN-eating semantics
