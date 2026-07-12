@@ -650,9 +650,10 @@ if(USE_VULKAN)
 		GS/Renderers/Vulkan/VKStreamBuffer.cpp
 		GS/Renderers/Vulkan/VKSwapChain.cpp
 	)
-	# VKLibretro.cpp needs the libretro Vulkan interface header shipped with
-	# the libretro frontend target.
-	target_include_directories(PCSX2_FLAGS INTERFACE "${CMAKE_SOURCE_DIR}/pcsx2-libretro")
+	# VKLibretro.cpp needs the libretro Vulkan HW-render interface header.
+	# Link it PRIVATE to PCSX2 (not the shared PCSX2_FLAGS) so the header path
+	# doesn't leak onto every target that consumes PCSX2_FLAGS.
+	target_link_libraries(PCSX2 PRIVATE libretro-headers)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/Vulkan/GSDeviceVK.h
 		GS/Renderers/Vulkan/GSTextureVK.h

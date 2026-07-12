@@ -14,7 +14,6 @@ endif()
 
 target_sources(pcsx2-libretro PRIVATE
 	Main.cpp
-	libretro.h
 )
 
 target_include_directories(pcsx2-libretro PRIVATE
@@ -26,6 +25,7 @@ target_include_directories(pcsx2-libretro PRIVATE
 target_link_libraries(pcsx2-libretro PRIVATE
 	PCSX2_FLAGS
 	PCSX2
+	libretro-headers
 )
 
 # A shared core must be fully position-independent — the pcsx2-sdl ET_EXEC
