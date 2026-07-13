@@ -112,6 +112,7 @@ jobs:
             -DENABLE_SDL_FRONTEND=ON \
             -DENABLE_GSRUNNER=ON \
             -DENABLE_TESTS=OFF \
+            -DENABLE_LIBRETRO=ON \
             -DENABLE_RECOMPILER_TEST_HOOKS=OFF \
             -DENABLE_SETCAP=OFF \
             -DUSE_BACKTRACE=OFF \
@@ -126,8 +127,16 @@ jobs:
         run: |
           ccache -p
           ccache -z
-          ninja pcsx2-sdl pcsx2-gsrunner
+          ninja pcsx2-sdl pcsx2-gsrunner pcsx2-libretro
           ccache -s
+
+      - name: Upload libretro core
+        uses: actions/upload-artifact@v7
+        with:
+          name: yaps2_libretro-linux-aarch64
+          path: |
+            build/bin/yaps2_libretro.so
+            yaps2_libretro.info
 
       - name: Package SDL Handheld Tarball
         env:
