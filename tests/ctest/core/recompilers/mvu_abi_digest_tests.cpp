@@ -81,6 +81,12 @@ struct DigestSet
 	// Conditional branch in a branch delay slot — pins the condEvilBranch
 	// target-select emission (ported at ABI v7; MGS2 VU0 solver hang).
 	u64 condEvilBranch;
+	// The only VU1 probe (added at ABI v14). Every probe above compiles on VU0, so
+	// VU1 emitter drift was invisible to this backstop - which is exactly how the
+	// ABI-14 change (E-bit flag validity, which applies to both VUs) could alter VU1
+	// codegen without moving a single digest above. Branch whose arms reach a
+	// program end, i.e. the shape that fix touches.
+	u64 vu1BranchToEbit;
 };
 
 struct AbiPin
@@ -95,20 +101,20 @@ constexpr AbiPin kPins[] = {
 	// LQ/SQ/ILW/ISW, so the folded ops leave their emitted shape unchanged — the
 	// digests are bit-identical to abi 3; the bump is to evict on-disk caches
 	// recorded with the pre-fold loadstore shape.
-	{4, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0, 0}},
+	{4, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0, 0, 0}},
 	// abi 5: mVUclamp2 2-row sign-clamp bounds (AX-02). The probes run under
 	// the default clamp config, where the sign-overflow path never emits —
 	// digests are bit-identical to abi 4; the bump evicts on-disk caches
 	// recorded with the old all-lane sign-clamp shape (the options sentinel
 	// can't distinguish those: same config, different emitter).
-	{5, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0, 0}},
+	{5, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0, 0, 0}},
 	// abi 6: lane-indexed FMUL broadcast fold unconditional (AX-14). The three
 	// original probes contain no broadcast ops, so their digests are
 	// bit-identical to abi 5; the bump evicts caches recorded with the old
 	// Dup-materialized broadcast shape, and the new broadcastChain probe pins
 	// the folded emission from here on (harvested from the first,
 	// deliberately red, run).
-	{6, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0x44bd2acfb23dff74, 0}},
+	{6, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0x44bd2acfb23dff74, 0, 0}},
 	// abi 7: condEvilBranch ported (conditional branch in a branch delay slot
 	// emits the badBranch/evilBranch target-select sequence; MGS2 VU0 solver
 	// hang). The four original probes contain no branch-in-delay-slot, so
@@ -116,37 +122,37 @@ constexpr AbiPin kPins[] = {
 	// recorded when that sequence emitted nothing, and the new condEvilBranch
 	// probe pins the ported emission from here on (harvested from the first,
 	// deliberately red, run).
-	{7, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0x44bd2acfb23dff74, 0xd04db07f3eb1a343}},
+	{7, {0x4c3b6e1330199619, 0xd6f530cc13f0d0aa, 0xfcead342cc0b7df8, 0x44bd2acfb23dff74, 0xd04db07f3eb1a343, 0}},
 	// abi 8: hot microVU scalars (divFlag/branch/VIbackup/VIxgkick/cycles/…)
 	// moved adjacent to the flag block and addressed as [gprMVUFlag, #imm]
 	// via mVUfieldMem instead of per-site absolute materialization. Every
 	// probe that touches those fields changes shape, and pre-8 payloads
 	// bake the old field addresses/offsets, so the bump must evict them.
-	{8, {0xb35dd0237372d734, 0xc3c40fd5a5ec19c7, 0x23682664f86a2f8d, 0xbdfce8a7ecebe6a6, 0x45837d5d1d23009f}},
+	{8, {0xb35dd0237372d734, 0xc3c40fd5a5ec19c7, 0x23682664f86a2f8d, 0xbdfce8a7ecebe6a6, 0x45837d5d1d23009f, 0}},
 	// abi 9: IBcc condition carry (doBranchCondCarry) — the condition
 	// computes into a pool temp and condBranch's tail Cmps it directly
 	// instead of the Ldrsh reload. Only the branch-bearing probe moved;
 	// the other four contain no conditional branch and are bit-identical
 	// to abi 8.
-	{9, {0xb35dd0237372d734, 0xb6dfab5c9a56d900, 0x23682664f86a2f8d, 0xbdfce8a7ecebe6a6, 0x45837d5d1d23009f}},
+	{9, {0xb35dd0237372d734, 0xb6dfab5c9a56d900, 0x23682664f86a2f8d, 0xbdfce8a7ecebe6a6, 0x45837d5d1d23009f, 0}},
 	// abi 10: inline jump-cache probe in normJumpCompile. The two
 	// jump-bearing probes (indirectJump, condEvilBranch — its continuation
 	// compiles a normal JR tail) change shape; the branch-only and
 	// straight-line probes are bit-identical to abi 9.
-	{10, {0xb35dd0237372d734, 0xb6dfab5c9a56d900, 0xc9abe2f224fb5710, 0xbdfce8a7ecebe6a6, 0x1fe80e2917de1c2d}},
+	{10, {0xb35dd0237372d734, 0xb6dfab5c9a56d900, 0xc9abe2f224fb5710, 0xbdfce8a7ecebe6a6, 0x1fe80e2917de1c2d, 0}},
 	// abi 11: resume-aware dispatch (VE-07). mVUtestCycles' budget-break
 	// exit BLs copyPLStateResume — a new stub id in the fixup stream. The
 	// instruction count and shape of every block are unchanged, but every
 	// block carries a testCycles, so every probe's fixup structure (and
 	// therefore digest) moves.
-	{11, {0x5606c91c74538771, 0xf50098b57b42c70c, 0xdda10863aa6fe8f7, 0xb93a633324c1d588, 0x6efd9e660ba61479}},
+	{11, {0x5606c91c74538771, 0xf50098b57b42c70c, 0xdda10863aa6fe8f7, 0xb93a633324c1d588, 0x6efd9e660ba61479, 0}},
 	// abi 12: exit-stub gprF re-save removed (VE-03); the defensive
 	// compile-failed guards grow a 5-insn inline flag backup. Only the two
 	// probes that emit those guards (indirectJump via normJumpCompile,
 	// condEvilBranch via condBranch badBranch) change shape; the
 	// straight-line, branch-both-arms, and broadcast probes are
 	// bit-identical to abi 11.
-	{12, {0x5606c91c74538771, 0xf50098b57b42c70c, 0x421bbc34e2552655, 0xb93a633324c1d588, 0x29d9172f7ccbd58f}},
+	{12, {0x5606c91c74538771, 0xf50098b57b42c70c, 0x421bbc34e2552655, 0xb93a633324c1d588, 0x29d9172f7ccbd58f, 0}},
 	// abi 13: mVUsetupFlags no longer emits status-flag register self-moves at
 	// block links (getFlagReg(i) == gprF[i], so an identity ring phase emitted up
 	// to four no-op ORRs; vixl keeps Mov(Wd,Wd) because the 32-bit move clears
@@ -154,7 +160,19 @@ constexpr AbiPin kPins[] = {
 	// condEvilBranch; straightLine/branchBothArms/broadcastChain have no
 	// exact-match link and are bit-identical to abi 12. Harvested from the first,
 	// deliberately red, run.
-	{13, {0x5606c91c74538771, 0xf50098b57b42c70c, 0x8022f1986a924c1c, 0xb93a633324c1d588, 0x49548c4995cf112f}},
+	{13, {0x5606c91c74538771, 0xf50098b57b42c70c, 0x8022f1986a924c1c, 0xb93a633324c1d588, 0x49548c4995cf112f, 0}},
+	// abi 14: E-bit flag validity (mVU.needFlagFinalize). A block reaching a program
+	// end used to elide the tail FMACs' flag writes that mVUendProgram then stores
+	// into VI[REG_*_FLAG], so finalisation read a never-written ring instance. Now
+	// the last tail FMAC's writes are emitted, and getLastFlagInst recovers an
+	// unwritten flag from the incoming ring phase. straightLine / branchBothArms /
+	// broadcastChain / vu1BranchToEbit all move (each ends in an E-bit);
+	// indirectJump is unchanged (it forces the bits on the JR/JALR arm, not the
+	// E-bit arm) and condEvilBranch is unchanged (no E-bit inside its
+	// 4-instruction scan window) - both are bit-identical to abi 13, which is the
+	// cross-check that this row moves only what the E-bit change touches.
+	// Harvested from the first, deliberately red, run.
+	{14, {0x52d7ab0dcf5ff0b0, 0xe306afec81428b0c, 0x8022f1986a924c1c, 0x119ed5c369c1435c, 0x49548c4995cf112f, 0x383abeec076a40fb}},
 };
 
 u64 CompileAndDigest(std::initializer_list<vu::VuOp> pairs)
@@ -178,6 +196,28 @@ u64 CompileAndDigest(std::initializer_list<vu::VuOp> pairs)
 	u64 digest = 0;
 	EXPECT_TRUE(mVUPersist::TestComputeEmitDigest(0, digest));
 	RecompilerTestEnvironment::ResetVuBlockCache(0);
+
+	EmuConfig.Speedhacks.vuFlagHack = savedFlagHack;
+	return digest;
+}
+
+// Same contract as CompileAndDigest, on VU1. Kept separate rather than
+// parameterised so the VU0 pins above can't shift if this one is edited.
+u64 CompileAndDigestVu1(std::initializer_list<vu::VuOp> pairs)
+{
+	const bool savedFlagHack = EmuConfig.Speedhacks.vuFlagHack;
+	EmuConfig.Speedhacks.vuFlagHack = true;
+
+	VuTestHarness h(1);
+	h.SetVf(1, 1.5f, -2.25f, 3.0f, 0.0625f);
+	h.SetVf(2, 4.0f, 0.5f, -1.0f, 8.0f);
+	h.SetVi(1, 1);
+	h.LoadProgram(pairs);
+	h.Run();
+	h.RunJitPreserveBlockCache();
+	u64 digest = 0;
+	EXPECT_TRUE(mVUPersist::TestComputeEmitDigest(1, digest));
+	RecompilerTestEnvironment::ResetVuBlockCache(1);
 
 	EmuConfig.Speedhacks.vuFlagHack = savedFlagHack;
 	return digest;
@@ -229,6 +269,17 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 		UpperOnly(bits::E | VADD_U(mask::xyzw, vf::vf6, vf::vf1, vf::vf2)), // pair 5: #2 target
 	});
 
+	// VU1 counterpart of branchBothArms: both arms reach a program end, which is
+	// the shape the ABI-14 E-bit lookahead forcing touches. Every other probe
+	// here is VU0, so without this one a VU1-only emitter change moves no digest.
+	actual.vu1BranchToEbit = CompileAndDigestVu1({
+		LowerOnly(VIBNE_L(vi::vi1, vi::vi0, 3)),
+		UpperOnly(VADD_U(mask::xyzw, vf::vf4, vf::vf1, vf::vf2)),
+		UpperOnly(bits::E | VSUB_U(mask::xyzw, vf::vf5, vf::vf1, vf::vf2)),
+		NopPair(),
+		UpperOnly(bits::E | VMUL_U(mask::xyzw, vf::vf6, vf::vf1, vf::vf2)),
+	});
+
 	mVUPersist::SetRecordingEnabled(false);
 
 	ASSERT_NE(actual.straightLine, 0u);
@@ -236,6 +287,7 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 	ASSERT_NE(actual.indirectJump, 0u);
 	ASSERT_NE(actual.broadcastChain, 0u);
 	ASSERT_NE(actual.condEvilBranch, 0u);
+	ASSERT_NE(actual.vu1BranchToEbit, 0u);
 
 	const u32 abi = mVUProgCache::GetCompilerAbiVersion();
 	const AbiPin* pin = nullptr;
@@ -251,7 +303,8 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 		<< ", 0x" << actual.branchBothArms
 		<< ", 0x" << actual.indirectJump
 		<< ", 0x" << actual.broadcastChain
-		<< ", 0x" << actual.condEvilBranch << "}";
+		<< ", 0x" << actual.condEvilBranch
+		<< ", 0x" << actual.vu1BranchToEbit << "}";
 
 	const auto explain = [&](const char* which, u64 got, u64 want) {
 		char buf[256];
@@ -277,6 +330,11 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 	{
 		EXPECT_EQ(actual.condEvilBranch, pin->digests.condEvilBranch)
 			<< explain("condEvilBranch", actual.condEvilBranch, pin->digests.condEvilBranch);
+	}
+	if (pin->digests.vu1BranchToEbit != 0) // probe added at abi 14; older rows unpinned
+	{
+		EXPECT_EQ(actual.vu1BranchToEbit, pin->digests.vu1BranchToEbit)
+			<< explain("vu1BranchToEbit", actual.vu1BranchToEbit, pin->digests.vu1BranchToEbit);
 	}
 }
 

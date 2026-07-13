@@ -79,7 +79,6 @@ TEST(Vu0FlagLinkReorder, MacRotationDistinctWrites)
 		LowerOnly(0),                                       // 10
 		EBitNopPair(),                                      // 11
 	});
-	h.IgnoreViInDiff(REG_STATUS_FLAG);
 	h.Run();
 	EXPECT_EQ(h.GetViJit(vi::vi1), h.GetViInterp(vi::vi1));
 	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
@@ -112,7 +111,6 @@ TEST(Vu0FlagLinkReorder, MacRotationDelaySlotFmac)
 		UpperOnly(VADD_U(mask::xyzw, vf::vf1, vf::vf5, vf::vf0)), // 9: DELAY SLOT FMAC (mac D)
 		EBitNopPair(),                                      // 10
 	});
-	h.IgnoreViInDiff(REG_STATUS_FLAG);
 	h.Run();
 	EXPECT_EQ(h.GetViJit(vi::vi1), h.GetViInterp(vi::vi1));
 	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
@@ -124,10 +122,6 @@ TEST(Vu0FlagLinkReorder, MacFlagAcrossExactMatchBackEdge)
 	h.SetVf(vf::vf2, 1.0f, 0.0f, -3.0f, 4.0f); // mixed lanes -> non-trivial MAC
 	h.LoadProgram(SelfLoop(VFMAND_L(vi::vi1, vi::vi3),
 		VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)));
-	// The unconsumed STATUS flag is finalised imprecisely at loop exit (a
-	// separate, pre-existing quirk - see DISABLED tripwire below); this test
-	// pins the MAC link path, so ignore STATUS here.
-	h.IgnoreViInDiff(REG_STATUS_FLAG);
 	h.Run();
 	EXPECT_EQ(h.GetViJit(vi::vi1), h.GetViInterp(vi::vi1));
 	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
@@ -149,9 +143,6 @@ TEST(Vu0FlagLinkReorder, StatusFlagAcrossExactMatchBackEdge)
 	h.SetVf(vf::vf2, 1.0f, 0.0f, -3.0f, 4.0f);
 	h.LoadProgram(SelfLoop(VFSAND_L(vi::vi1, 0xFFFu),
 		VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)));
-	// Isolate STATUS: MAC is written but unconsumed here, so its final register
-	// hits the same pre-existing finalisation quirk as the tripwire below.
-	h.IgnoreViInDiff(REG_MAC_FLAG);
 	h.Run();
 	EXPECT_EQ(h.GetViJit(vi::vi1), h.GetViInterp(vi::vi1));
 	EXPECT_EQ(h.GetViJit(REG_STATUS_FLAG), h.GetViInterp(REG_STATUS_FLAG));
@@ -176,19 +167,81 @@ TEST(Vu0FlagLinkReorder, StatusSingleBlockControl)
 	EXPECT_EQ(h.GetViJit(REG_STATUS_FLAG), h.GetViInterp(REG_STATUS_FLAG));
 }
 
-// TRIPWIRE (DISABLED): pre-existing JIT-vs-interp divergence, present since at
-// least 891f3b519 and independent of the block-link reorder. When an FMAC-
-// written flag is NOT consumed across an exact-match loop back-edge, its final
-// architectural register is finalised from the wrong ring instance: here the
-// loop writes MAC 3x/iter but only STATUS is read, and post-E-bit REG_MAC_FLAG
-// reads JIT=0x0 vs interp=0x24 (0x24 is the correct MAC for the last VADD).
-// Enable once the non-exact-match flag finalisation at loop exit is fixed.
-TEST(Vu0FlagLinkReorder, DISABLED_UnconsumedMacFlagFinalizedWrongAtLoopExit)
+// Control for the E-bit lookahead fix below: the same unconsumed-MAC program,
+// but with the E-bit in the block that writes MAC (no branch). This always
+// passed - eBitPass1 already forces needExactMatch|=7 on VU0 when it sees the
+// E-bit in the block being compiled. It is the asymmetry with the cross-block
+// case that made the bug: keep this passing, or the in-block rule has regressed.
+TEST(Vu0FlagLinkReorder, UnconsumedMacFlagInBlockEbitControl)
+{
+	VuTestHarness h(0);
+	h.SetVf(vf::vf2, 1.0f, 0.0f, -3.0f, 4.0f);
+	h.LoadProgram({
+		UpperOnly(VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)),
+		UpperOnly(VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)),
+		UpperOnly(VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)),
+		BareNopPair(), BareNopPair(), BareNopPair(), BareNopPair(),
+		EBitNopPair(),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
+}
+
+// Regression: a flag written but never read by any instruction still has to be
+// finalised correctly, because mVUendProgram stores it into VI[REG_*_FLAG] and
+// COP2 can read it back on VU0. Here the loop writes MAC 3x/iter and reads only
+// STATUS, and the E-bit sits in a successor block - so _mVUflagPass's lookahead
+// used to hit the E-bit and break without marking any flag needed. The loop body
+// then elided the very MAC writes the E-bit stores, and REG_MAC_FLAG finalised
+// from a never-written ring instance (findFlagInst's all-(-1) fallback, slot 0):
+// JIT=0x0 vs interp=0x24. Guards the ABI-14 fix; also covers STATUS/CLIP, which
+// is why no test in this file needs IgnoreViInDiff any more.
+TEST(Vu0FlagLinkReorder, UnconsumedMacFlagFinalizedAtSuccessorBlockEbit)
 {
 	VuTestHarness h(0);
 	h.SetVf(vf::vf2, 1.0f, 0.0f, -3.0f, 4.0f);
 	h.LoadProgram(SelfLoop(VFSAND_L(vi::vi1, 0xFFFu),
 		VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)));
+	h.Run();
+	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
+}
+
+// Same program on VU1. The E-bit lookahead fix is deliberately not gated on
+// isVU0 (unlike the in-block eBitPass1 rule it copies, which is VU0-only because
+// COP2 reads VU0's flags back): mVUdispatcherA reloads the flag ring from
+// VI[REG_*_FLAG] at program entry, so a stale instance left by one VU1 program
+// is observable by the next one that reads MAC before writing it. Failed the
+// same way as the VU0 case (JIT=0x0 vs interp=0x24) while the gate was in place.
+TEST(Vu0FlagLinkReorder, Vu1UnconsumedMacFlagFinalizedAtSuccessorBlockEbit)
+{
+	VuTestHarness h(1);
+	h.SetVf(vf::vf2, 1.0f, 0.0f, -3.0f, 4.0f);
+	h.LoadProgram(SelfLoop(VFSAND_L(vi::vi1, 0xFFFu),
+		VADD_U(mask::xyzw, vf::vf1, vf::vf2, vf::vf0)));
+	h.Run();
+	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
+}
+
+// The other half of the E-bit rule: an FMAC inside the E-bit block. Here the
+// forcing has to come from eBitPass1 (the in-block rule), not from the lookahead
+// - the block that ends the program computes the flag itself. Both rules were
+// isVU0-gated; ungating only the lookahead left this case broken on VU1, where
+// REG_MAC_FLAG finalised from the branch delay slot's VADD (0x40) instead of the
+// E-bit block's own VMUL (0x60). Caught by the VU1 ABI-digest probe, which runs
+// this exact program shape through the JIT-vs-interp diff.
+TEST(Vu0FlagLinkReorder, Vu1FmacInsideEbitBlockFinalizesOwnMac)
+{
+	VuTestHarness h(1);
+	h.SetVf(vf::vf1, 1.5f, -2.25f, 3.0f, 0.0625f);
+	h.SetVf(vf::vf2, 4.0f, 0.5f, -1.0f, 8.0f);
+	h.SetVi(vi::vi1, 1); // branch taken
+	h.LoadProgram({
+		LowerOnly(VIBNE_L(vi::vi1, vi::vi0, 3)),                  // 0: taken -> pair 4
+		UpperOnly(VADD_U(mask::xyzw, vf::vf4, vf::vf1, vf::vf2)), // 1: delay slot (MAC 0x40)
+		UpperOnly(VSUB_U(mask::xyzw, vf::vf5, vf::vf1, vf::vf2)), // 2: skipped
+		BareNopPair(),                                            // 3
+		VuOp{0, bits::E | VMUL_U(mask::xyzw, vf::vf6, vf::vf1, vf::vf2)}, // 4: E-bit FMAC (MAC 0x60)
+	});
 	h.Run();
 	EXPECT_EQ(h.GetViJit(REG_MAC_FLAG), h.GetViInterp(REG_MAC_FLAG));
 }
