@@ -6,6 +6,7 @@
 #include "harness/EeRecTestHarness.h"
 
 #include "Config.h"
+#include "Counters.h"
 #include "vtlb.h"
 
 #include <gtest/gtest.h>
@@ -1282,4 +1283,36 @@ TEST(EeRecLoadStore, ConstQuadStoreMaterializesAndAliasLoadKillsConst)
 	h.ExpectGpr64(reg::v0, 0x20004ull);
 	h.ExpectGpr128(reg::a0, 0x1111222233334444ull, 0x5555666677778888ull);
 	h.ExpectGpr64(reg::v1, 0x33334444ull);
+}
+
+TEST(EeRecLoadStore, ConstCounterReadEventTestExitResumesAtNextPc)
+{
+	// A const-address read of an EE counter (0x10000000..0x10001FFF) takes the
+	// const-paddr MMIO shortcut AND ends the block with the g_branch=2
+	// event-test exit (forceEventTest). That exit's FLUSH_EVERYTHING does NOT
+	// include FLUSH_PC (0x1ff vs 0x200), so the shortcut's seam flush is the
+	// only place the resume pc reaches cpuRegs.pc before the dispatcher reads
+	// it. The handler-identity FLUSH_PC trim (hardware handlers skip the pc
+	// store) must therefore still flush pc on the forceEventTest path — if it
+	// doesn't, the JIT re-dispatches at a stale pc and the instructions after
+	// the counter read never execute.
+	// T0 stopped + zeroed so the read is deterministic on both sides. Direct
+	// struct writes only — rcntInit() would reschedule the vsync event to
+	// immediately-due, and the event test this block ends with would then
+	// run VSyncStart (input poll, GS) in an env that can't host it.
+	counters[0].modeval = 0;
+	counters[0].count = 0;
+	EeRecTestHarness h;
+	vtlb_ClearLoadStoreInfo();
+	h.LoadProgram({
+		LUI(reg::a0, 0x1000),             // a0 = 0x10000000 (T0_COUNT), const
+		LW(reg::v0, 0, reg::a0),          // counter read: event-test block end
+		ADDIU(reg::v1, reg::zero, 0x123), // next block, reached via cpuRegs.pc
+	});
+	h.Run();
+	h.ExpectGpr64(reg::v0, 0ull);
+	h.ExpectGpr64(reg::v1, 0x123ull);
+	// Shape: the counter read stayed on the const-paddr shortcut.
+	EXPECT_FALSE(vtlb_IsFaultingPC(RecompilerTestEnvironment::kProgramPc + 4))
+		<< "counter read degraded off the const-paddr shortcut";
 }
