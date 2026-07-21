@@ -61,6 +61,17 @@ protected:
 		return (call ? 0x94000000u : 0x14000000u) | (static_cast<u32>(imm26) & 0x03FFFFFFu);
 	}
 
+	// Point every link site registered for `pc` at `target`
+	void PatchLinksTo(u32 pc, uptr target)
+	{
+		const auto range = links.equal_range(pc);
+		for (auto it = range.first; it != range.second; ++it)
+		{
+			const uptr site = it->second & ~kLinkSiteCallBit;
+			PatchAtomic(site, EncodeB(site, target, (it->second & kLinkSiteCallBit) != 0));
+		}
+	}
+
 	static void PatchAtomic(uptr site, u32 instr)
 	{
 		// 4-byte aligned word stores are atomic on AArch64.
@@ -107,14 +118,19 @@ public:
 		// Patch any pending links waiting for a block at this PC. After
 		// patching they go directly to fnptr instead of routing through
 		// JITCompile.
-		const auto range = links.equal_range(startpc);
-		for (auto it = range.first; it != range.second; ++it)
-		{
-			const uptr site = it->second & ~kLinkSiteCallBit;
-			PatchAtomic(site, EncodeB(site, fnptr, (it->second & kLinkSiteCallBit) != 0));
-		}
-
+		PatchLinksTo(startpc, fnptr);
 		return blocks.insert(startpc, fnptr);
+	}
+
+	// Recompile-reuse: bind an existing (still-live) BASEBLOCKEX to freshly
+	// emitted code. The entry's fnptr and every link site targeting this PC
+	// must move to the new copy: leaving them behind keeps linked callers
+	// executing the old copy while the LUT dispatches the new one, and makes
+	// x86size (computed as end - fnptr) span both copies.
+	void Rebind(BASEBLOCKEX* block, uptr fnptr)
+	{
+		PatchLinksTo(block->startpc, fnptr);
+		block->fnptr = fnptr;
 	}
 
 	int LastIndex(u32 startpc) const
