@@ -723,8 +723,13 @@ void iFlushCall(int flushtype)
 	if (flushtype & FLUSH_ALL_X86)
 		_flushArm64GPRregs();
 
+	// the callee can't write guest GPRs, so const values are written back
+	// for memory coherence but the marks survive. Post-call code keeps
+	// folding const addresses (x86 parity: FLUSH_FULLVTLB doesn't even
+	// write the values). Without the modifier (interpreter seams),
+	// delete: the callee may change cpuRegs.GPR.
 	if (flushtype & FLUSH_CONSTANT_REGS)
-		_flushConstRegs(true);
+		_flushConstRegs(!(flushtype & FLUSH_CONST_KEEP));
 
 	if ((flushtype & FLUSH_PC) && !g_cpuFlushedPC)
 	{
@@ -2958,6 +2963,24 @@ u32 recEeBlockGuestSize(u32 pc_query)
 	return b ? b->size : 0;
 }
 
+// The block entry at pc_query as the linker sees it (BASEBLOCKEX fnptr
+// + host byte size) plus the LUT dispatch target, so tests can assert
+// the two dispatch routes agree. A mid-compile recClear whose
+// removed-straddler extent covers the in-progress startpc wipes the LUT
+// entry; if recRecompile doesn't restore it, the next dispatch
+// recompiles into the live BASEBLOCKEX and the two routes diverge.
+// Returns false if no entry starts exactly at pc_query.
+bool recEeBlockHostInfo(u32 pc_query, uptr* fnptr, u32* host_size, uptr* lut_fnptr)
+{
+	BASEBLOCKEX* b = recBlocks.Get(HWADDR(pc_query));
+	if (!b || b->startpc != HWADDR(pc_query))
+		return false;
+	*fnptr = b->fnptr;
+	*host_size = b->x86size;
+	*lut_fnptr = GETBLOCK(pc_query)->GetFnptr();
+	return true;
+}
+
 // Test-harness recLUT coverage introspection: does this guest PC dispatch to
 // a real (compile-on-first-hit) LUT page rather than UnmappedRecLUTPage?
 // The harness can't execute code from ROM regions (it's hardwired to EE
@@ -3238,13 +3261,29 @@ static void recRecompile(const u32 startpc)
 
 	s_pCurBlockEx = recBlocks.Get(HWADDR(startpc));
 	if (!s_pCurBlockEx || s_pCurBlockEx->startpc != HWADDR(startpc))
+	{
 		s_pCurBlockEx = recBlocks.New(HWADDR(startpc), block_fnptr);
+	}
+	else
+	{
+		// A live entry at recompile time means an invalidation reset the LUT
+		// without removing the BASEBLOCKEX. If it ever fires, rebind the
+		// entry and its link sites so the linker and dispatcher agree on the
+		// new copy instead of executing stale code.
+		pxAssert(false);
+		recBlocks.Rebind(s_pCurBlockEx, block_fnptr);
+	}
 
 	g_branch = 0;
 	cop2VfCacheReset();
 	cop2ClampConstsInvalidate(); // SL-13: q25/q26 state unknown at block entry
 
-	s_pCurBlock->SetFnptr(block_fnptr);
+	// The LUT publish (s_pCurBlock->SetFnptr) happens at the end of this
+	// compile, after the GE-18 stale-overlap walk — matching x86. Publishing
+	// here instead lets that walk's mid-compile recClear wipe the LUT entry
+	// with nothing to restore it: the next dispatch then recompiles into the
+	// surviving BASEBLOCKEX, leaving its fnptr (the linker's target) on the
+	// abandoned old copy.
 	s_nBlockCycles = 0;
 	s_nBlockInterlocked = false;
 
@@ -3861,6 +3900,13 @@ StartRecomp:
 
 		memcpy(&recRAMCopy[HWADDR(startpc) / 4], PSM(startpc), pc - startpc);
 	}
+
+	// LUT publish deliberately after the stale-overlap walk (x86 parity): the
+	// walk's recClear skips this block's Remove() but its ClearRecLUT tail
+	// can span startpc when a removed straddler-from-below covers it;
+	// publishing here restores the entry. Nothing dispatches mid-compile,
+	// so the late publish loses nothing.
+	s_pCurBlock->SetFnptr(block_fnptr);
 
 	if (g_branch == 2)
 	{

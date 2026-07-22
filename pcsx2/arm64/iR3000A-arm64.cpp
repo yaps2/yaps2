@@ -1306,7 +1306,18 @@ static void iopRecRecompile(const u32 startpc)
 
 	s_pCurBlockEx = recBlocks.Get(HWADDR(startpc));
 	if (!s_pCurBlockEx || s_pCurBlockEx->startpc != HWADDR(startpc))
+	{
 		s_pCurBlockEx = recBlocks.New(HWADDR(startpc), block_fnptr);
+	}
+	else
+	{
+		// A live entry at recompile time means an invalidation reset the LUT
+		// without removing the BASEBLOCKEX. If it ever fires, rebind the entry
+		// and its link sites so the linker and dispatcher agree on the new
+		// copy instead of executing stale code.
+		pxAssert(false);
+		recBlocks.Rebind(s_pCurBlockEx, block_fnptr);
+	}
 
 	psxbranch = 0;
 
