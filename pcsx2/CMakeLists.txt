@@ -1236,6 +1236,10 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 	${LIBC_LIBRARIES}
 )
 
+if(ARCH_ARM64)
+	target_link_libraries(PCSX2_FLAGS INTERFACE FFmpegIDCT::FFmpegIDCT)
+endif()
+
 if(WIN32)
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		WIL::WIL
