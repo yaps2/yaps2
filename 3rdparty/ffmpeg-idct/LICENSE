@@ -1,0 +1,13 @@
+The files in this directory are extracted from FFmpeg (https://ffmpeg.org/).
+
+Original authors:
+  simple_idct_neon.S:
+    Copyright (c) 2008 Mans Rullgard <mans@mansr.com>
+    Copyright (c) 2017 Matthieu Bouron <matthieu.bouron@gmail.com>
+    Based on Simple IDCT, Copyright (c) 2001 Michael Niedermayer <michaelni@gmx.at>
+
+  asm.S:
+    Copyright (c) 2008 Mans Rullgard <mans@mansr.com>
+
+Licensed under the GNU Lesser General Public License version 2.1 or later.
+See the individual source files for the full license text.

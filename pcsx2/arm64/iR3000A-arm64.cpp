@@ -185,6 +185,82 @@ static const void* _DynGen_EnterRecompiledCode()
 	return retval;
 }
 
+// Out-of-line RAM-store fast path, one stub per store width (see
+// rpsxStoreGeneric, which emits a single BL here per store site — keeping
+// sites baseline-sized so the fast path costs no extra icache footprint).
+//
+// Calling convention: w0 = guest address, w1 = value, called after a full
+// register flush (all volatiles dead, x21 = &psxRegs pinned). iopMemWrite*
+// masks addresses to 0x1fffffff; within that space the only WLUT-mapped
+// write target is main RAM on pages 0x00-0x7f. Every hw region (0x1f80,
+// 0x1f40, SIF 0x1d00, DEV9 0x1000, SPU2 0x1f90, parallel port 0x1f00, ROM
+// 0x1fc0) and the unmapped rest have at least one of bits 23-28 set, and
+// those bits survive the phys mask — so (addr & 0x1f800000) == 0 exactly
+// selects "iopMemWrite* would take the WLUT RAM branch" for every KUSEG/
+// KSEG0/KSEG1 mirror. RAM stores hit Main[addr & (ExposedIopRam-1)] (the
+// same bytes the WLUT path writes; the same mask recLUT_SetPage collapses
+// mirrors with, so the masked value doubles as the g_iopCodeCov probe
+// index), are swallowed when CP0 Status IsC is set (cache isolated — no
+// store, no SMC clear), and only take the SMC clear call when the granule
+// counter is nonzero (i.e. when psxRecClearMem would not have early-outed).
+// Anything else tail-jumps to the C handler, which returns to the store
+// site directly.
+//
+// Regenerated on every recResetIOP, so the baked ExposedIopRam mask and
+// RAM base track extra-memory-mode flips (which discard all blocks).
+const void* g_iopStoreStub[3] = {};
+
+static const void* _DynGen_StoreStub(int size)
+{
+	u8* retval = armGetCurrentCodePointer();
+
+	const u32 ram_mask = Ps2MemSize::ExposedIopRam - 1;
+	a64::Label slowPath, swallowed, clearHit;
+
+	armAsm->Tst(a64::w0, 0x1f800000);
+	armAsm->B(&slowPath, a64::ne);
+
+	armAsm->Ldr(a64::w3, armPsxRegMem(&psxRegs.CP0.n.Status));
+	armAsm->Tbnz(a64::w3, 16, &swallowed);
+
+	armMoveAddressToReg(a64::x4, iopMem->Main);
+	armAsm->And(a64::w2, a64::w0, ram_mask);
+	switch (size)
+	{
+		case 8:  armAsm->Strb(a64::w1, a64::MemOperand(a64::x4, a64::x2)); break;
+		case 16: armAsm->Strh(a64::w1, a64::MemOperand(a64::x4, a64::x2)); break;
+		case 32: armAsm->Str(a64::w1, a64::MemOperand(a64::x4, a64::x2));  break;
+	}
+
+	armMoveAddressToReg(a64::x5, g_iopCodeCov);
+	armAsm->Lsr(a64::w6, a64::w2, kIopCovShift);
+	armAsm->Ldrh(a64::w6, a64::MemOperand(a64::x5, a64::x6, a64::LSL, 1));
+	armAsm->Cbnz(a64::w6, &clearHit);
+	armAsm->Bind(&swallowed);
+	armAsm->Ret();
+
+	// Rare: the store landed in a granule with live block coverage — run the
+	// full SMC clear (w0 still holds the original address).
+	armAsm->Bind(&clearHit);
+	armAsm->Sub(a64::sp, a64::sp, 16);
+	armAsm->Stp(a64::x29, a64::lr, a64::MemOperand(a64::sp));
+	armEmitCall((void*)iopStoreClearHit);
+	armAsm->Ldp(a64::x29, a64::lr, a64::MemOperand(a64::sp));
+	armAsm->Add(a64::sp, a64::sp, 16);
+	armAsm->Ret();
+
+	// Hw/unmapped target: tail-jump to C, which returns to the store site.
+	armAsm->Bind(&slowPath);
+	switch (size)
+	{
+		case 8:  armEmitJmp((void*)iopMemWrite8);  break;
+		case 16: armEmitJmp((void*)iopMemWrite16); break;
+		case 32: armEmitJmp((void*)iopMemWrite32); break;
+	}
+
+	return retval;
+}
+
 // Error handler for jumps to unmapped memory
 static const void* _DynGen_UnmappedRecLUTPage()
 {
@@ -210,6 +286,9 @@ static void _DynGen_Dispatchers()
 	iopJITCompile = _DynGen_JITCompile();
 	iopEnterRecompiledCode = _DynGen_EnterRecompiledCode();
 	iopUnmappedRecLUTPage = _DynGen_UnmappedRecLUTPage();
+	g_iopStoreStub[0] = _DynGen_StoreStub(8);
+	g_iopStoreStub[1] = _DynGen_StoreStub(16);
+	g_iopStoreStub[2] = _DynGen_StoreStub(32);
 
 	// Block linker needs iopJITCompile so it can route stale / not-yet-
 	// compiled link sites through the dispatcher path. Mirrors EE rec
@@ -1040,8 +1119,44 @@ void rpsxBREAK()
 
 // recLUT_SetPage is defined in BaseblockEx.h (architecture-independent)
 
+// Block-coverage counters for the recClearIOP fast path. g_iopCodeCov[g]
+// counts live recBlocks entries whose [startpc, startpc+size*4) span overlaps
+// 256-byte granule g of the HWADDR window. Every qualifying IOP RAM store
+// funnels through psxRecClearMem (SMC detection), and in practice ~100% of
+// them hit addresses no compiled block covers — a zero counter proves that in
+// O(1) and skips the binary search over recBlocks entirely. Maintained at the
+// three block-lifecycle points in this file (size-finalize, exact-startpc
+// recompile reuse, psxRecClearMem removal) and zeroed on recResetIOP.
+// rpsxStoreGeneric additionally probes it inline on the JIT RAM-store fast
+// path (declared in iR3000A-arm64.h alongside kIopCovShift/kIopCovSpan).
+//
+// ROM-resident blocks (startpc >= kIopCovSpan, e.g. BIOS at 0x1fcxxxxx) are
+// never counted: stores can't target ROM, so no clear ever queries them.
+u16 g_iopCodeCov[kIopCovSpan >> kIopCovShift];
+
+static __fi void iopCovAdjust(u32 startpc_hw, u32 bytes, int delta)
+{
+	if (startpc_hw >= kIopCovSpan || bytes == 0)
+		return;
+	const u32 gfirst = startpc_hw >> kIopCovShift;
+	const u32 glast = (startpc_hw + bytes - 1) >> kIopCovShift;
+	pxAssert(glast < (kIopCovSpan >> kIopCovShift));
+	for (u32 g = gfirst; g <= glast; g++)
+	{
+		pxAssert(delta > 0 ? g_iopCodeCov[g] != 0xFFFF : g_iopCodeCov[g] != 0);
+		g_iopCodeCov[g] = static_cast<u16>(static_cast<int>(g_iopCodeCov[g]) + delta);
+	}
+}
+
 static __fi u32 psxRecClearMem(u32 pc)
 {
+	// O(1) reject: if no live block's span overlaps this granule, nothing can
+	// need clearing — skip ahead to the next granule boundary. This is the
+	// overwhelmingly common case (IOP stores to data addresses).
+	const u32 hw = HWADDR(pc);
+	if (hw < kIopCovSpan && g_iopCodeCov[hw >> kIopCovShift] == 0)
+		return (((hw >> kIopCovShift) + 1) << kIopCovShift) - hw;
+
 	// Look up the containing block via recBlocks instead of testing the
 	// per-instruction LUT fnptr. The LUT only patches block-head slots away
 	// from iopJITCompile; mid-block words still hold the trampoline, so a
@@ -1069,6 +1184,7 @@ static __fi u32 psxRecClearMem(u32 pc)
 
 		lowerextent = std::min(lowerextent, pexblock->startpc);
 		upperextent = std::max(upperextent, pexblock->startpc + pexblock->size * 4);
+		iopCovAdjust(pexblock->startpc, pexblock->size * 4, -1);
 		recBlocks.Remove(blockidx, blockidx);
 	}
 
@@ -1098,6 +1214,17 @@ static void recClearIOP(u32 Addr, u32 Size)
 	for (u32 i = Addr; i < end; i += PSXREC_CLEARM(i))
 		;
 	HostSys::EndCodeWrite();
+}
+
+// Called from the JIT inline RAM-store fast path (rpsxStoreGeneric) when the
+// stored-to granule has live block coverage. Must mirror what iopMemWrite*
+// would have done: mask to 0x1fffffff at entry (the g_psxMaxRecMem filter in
+// PSXREC_CLEARM sees the masked value), then psxCpu->Clear(mem & ~3, 1),
+// which routes through recClearIOP for the BeginCodeWrite scope around the
+// entry-point patching.
+void iopStoreClearHit(u32 addr)
+{
+	recClearIOP((addr & 0x1fffffff) & ~3u, 1);
 }
 
 static void iopClearRecLUT(BASEBLOCK* base, int count)
@@ -1217,6 +1344,7 @@ void recResetIOP()
 		memset(s_pInstCache, 0, sizeof(EEINST) * s_nInstCacheSize);
 
 	recBlocks.Reset();
+	memset(g_iopCodeCov, 0, sizeof(g_iopCodeCov));
 	g_psxMaxRecMem = 0;
 
 	psxbranch = 0;
@@ -1307,6 +1435,10 @@ static void iopRecRecompile(const u32 startpc)
 	s_pCurBlockEx = recBlocks.Get(HWADDR(startpc));
 	if (!s_pCurBlockEx || s_pCurBlockEx->startpc != HWADDR(startpc))
 		s_pCurBlockEx = recBlocks.New(HWADDR(startpc), block_fnptr);
+	else
+		// Exact-startpc recompile reuse: retire the old span's coverage before
+		// the new size lands (the two spans can differ).
+		iopCovAdjust(s_pCurBlockEx->startpc, s_pCurBlockEx->size * 4, -1);
 
 	psxbranch = 0;
 
@@ -1438,6 +1570,7 @@ StartRecomp:
 
 	pxAssert((psxpc - startpc) >> 2 <= 0xffff);
 	s_pCurBlockEx->size = (psxpc - startpc) >> 2;
+	iopCovAdjust(s_pCurBlockEx->startpc, s_pCurBlockEx->size * 4, +1);
 
 	if (!(psxpc & 0x10000000))
 		g_psxMaxRecMem = std::max((psxpc & ~0xa0000000), g_psxMaxRecMem);

@@ -14,6 +14,13 @@
 #include "IPU/yuv2rgb.h"
 #include "IPU/IPU_MultiISA.h"
 
+#ifdef ARCH_ARM64
+extern "C" {
+	void ff_simple_idct_neon(int16_t *data);
+	void ff_simple_idct_put_neon(uint8_t *dest, ptrdiff_t line_size, int16_t *data);
+}
+#endif
+
 // the IPU is fixed to 16 byte strides (128-bit / QWC resolution):
 static const uint decoder_stride = 16;
 
@@ -49,9 +56,17 @@ static constexpr mpeg2_scan_pack make_scan_pack()
 
 	for (int i = 0; i < 64; i++) {
 		int j = mpeg2_scan_norm[i];
+#ifdef ARCH_ARM64
+		pack.norm[i] = (j & 0x24) | ((j & 3) << 3) | ((j >> 3) & 3); // FF_IDCT_PERM_PARTTRANS
+#else
 		pack.norm[i] = ((j & 0x36) >> 1) | ((j & 0x09) << 2);
+#endif
 		j = mpeg2_scan_alt[i];
+#ifdef ARCH_ARM64
+		pack.alt[i] = (j & 0x24) | ((j & 3) << 3) | ((j >> 3) & 3); // FF_IDCT_PERM_PARTTRANS
+#else
 		pack.alt[i] = ((j & 0x36) >> 1) | ((j & 0x09) << 2);
+#endif
 	}
 
 	return pack;
@@ -215,6 +230,9 @@ __fi static void BUTTERFLY(int& t0, int& t1, int w0, int w1, int d0, int d1)
 
 __ri static void IDCT_Block(s16* block)
 {
+#ifdef ARCH_ARM64
+	ff_simple_idct_neon(block);
+#else
 	for (int i = 0; i < 8; i++)
 	{
 		s16* const rblock = block + 8 * i;
@@ -320,10 +338,15 @@ __ri static void IDCT_Block(s16* block)
 		cblock[8 * 6] = (a1 - b1) >> 17;
 		cblock[8 * 7] = (a0 - b0) >> 17;
 	}
+#endif
 }
 
 __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
 {
+#ifdef ARCH_ARM64
+	ff_simple_idct_put_neon(dest, stride, block);
+	std::memset(block, 0, 128);
+#else
 	IDCT_Block(block);
 
 	for (int i = 0; i < 8; i++)
@@ -342,6 +365,7 @@ __ri static void IDCT_Copy(s16* block, u8* dest, const int stride)
 		dest += stride;
 		block += 8;
 	}
+#endif
 }
 
 

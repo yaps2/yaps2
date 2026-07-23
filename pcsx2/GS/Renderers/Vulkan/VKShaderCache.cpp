@@ -141,15 +141,25 @@ bool dyn_shaderc::Open()
 
 #ifdef _WIN32
 	const std::string libname = DynamicLibrary::GetVersionedFilename("shaderc_shared");
-#else
-	// Use versioned, bundle post-processing adds it..
-	const std::string libname = DynamicLibrary::GetVersionedFilename("shaderc_shared", 1);
-#endif
 	if (!s_library.Open(libname.c_str(), &error))
 	{
 		ERROR_LOG("Failed to load shaderc: {}", error.GetDescription());
 		return false;
 	}
+#else
+	// Use versioned, bundle post-processing adds it..
+	const std::string libname = DynamicLibrary::GetVersionedFilename("shaderc_shared", 1);
+	if (!s_library.Open(libname.c_str(), &error))
+	{
+		// Debian ships the library as libshaderc.so.1, without the _shared suffix.
+		const std::string alt_libname = DynamicLibrary::GetVersionedFilename("shaderc", 1);
+		if (!s_library.Open(alt_libname.c_str(), &error))
+		{
+			ERROR_LOG("Failed to load shaderc: {}", error.GetDescription());
+			return false;
+		}
+	}
+#endif
 
 #define LOAD_FUNC(F) \
 	if (!s_library.GetSymbol(#F, &F)) \
